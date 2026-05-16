@@ -180,6 +180,49 @@ impl Storage for D1Storage {
         .await
     }
 
+    async fn latest_game_with_match_for_guild(
+        &self,
+        guild_id: &str,
+    ) -> StorageResult<Option<GameRow>> {
+        first(
+            self.db
+                .prepare(
+                    "
+                    SELECT game_id, guild_id, channel_id, creator_discord_id, status, mode,
+                           winning_side, version, riot_match_id, consecutive_404
+                    FROM games
+                    WHERE guild_id = ?1 AND riot_match_id IS NOT NULL
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    ",
+                )
+                .bind(&[js(guild_id)])?,
+        )
+        .await
+    }
+
+    async fn game_by_riot_match_id(
+        &self,
+        guild_id: &str,
+        riot_match_id: &str,
+    ) -> StorageResult<Option<GameRow>> {
+        first(
+            self.db
+                .prepare(
+                    "
+                    SELECT game_id, guild_id, channel_id, creator_discord_id, status, mode,
+                           winning_side, version, riot_match_id, consecutive_404
+                    FROM games
+                    WHERE guild_id = ?1 AND riot_match_id = ?2
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    ",
+                )
+                .bind(&[js(guild_id), js(riot_match_id)])?,
+        )
+        .await
+    }
+
     async fn game_by_id(&self, game_id: &GameId) -> StorageResult<GameRow> {
         first(
             self.db

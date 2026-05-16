@@ -35,6 +35,15 @@ pub trait Storage {
         now: i64,
     ) -> StorageResult<()>;
     async fn open_game_for_guild(&self, guild_id: &str) -> StorageResult<Option<GameRow>>;
+    async fn latest_game_with_match_for_guild(
+        &self,
+        guild_id: &str,
+    ) -> StorageResult<Option<GameRow>>;
+    async fn game_by_riot_match_id(
+        &self,
+        guild_id: &str,
+        riot_match_id: &str,
+    ) -> StorageResult<Option<GameRow>>;
     async fn game_by_id(&self, game_id: &GameId) -> StorageResult<GameRow>;
     async fn roster(&self, game_id: &GameId) -> StorageResult<Vec<RosterPlayer>>;
     async fn assign_teams(

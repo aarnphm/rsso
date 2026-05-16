@@ -25,6 +25,7 @@ pub enum DiscordCommand {
     },
     Results(ResultsCommand),
     Finish(FinishCommand),
+    Hydrate(HydrateCommand),
     End {
         game_id: GameId,
     },
@@ -60,6 +61,12 @@ pub struct FinishCommand {
 pub struct ResultsCommand {
     pub game_id: Option<GameId>,
     pub winner: Option<TeamSide>,
+    pub riot_match_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HydrateCommand {
+    pub game_id: Option<GameId>,
     pub riot_match_id: Option<String>,
 }
 
@@ -100,6 +107,7 @@ pub fn parse_command(data: &ApplicationCommandData) -> Result<DiscordCommand, Co
         }),
         "results" => parse_results(data),
         "finish" => parse_finish(data),
+        "hydrate" => parse_hydrate(data),
         "end" => Ok(DiscordCommand::End {
             game_id: GameId::new(string_option(&data.options, "game_id")?),
         }),
@@ -149,6 +157,13 @@ fn parse_results(data: &ApplicationCommandData) -> Result<DiscordCommand, Comman
         game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
         winner: optional_team_option(&data.options, "winner")?,
         riot_match_id,
+    }))
+}
+
+fn parse_hydrate(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
+    Ok(DiscordCommand::Hydrate(HydrateCommand {
+        game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
+        riot_match_id: optional_normalize_match_id_option(&data.options, "riot_match_id")?,
     }))
 }
 
@@ -424,5 +439,23 @@ mod tests {
         );
         assert_eq!(command.winner, None);
         assert_eq!(command.riot_match_id, Some("NA1_4901234567".to_owned()));
+    }
+
+    #[test]
+    fn parses_hydrate_numeric_match_id() {
+        let data = ApplicationCommandData {
+            name: "hydrate".to_owned(),
+            options: vec![CommandOption {
+                name: "riot_match_id".to_owned(),
+                value: Some(json!("5561726994")),
+                options: vec![],
+            }],
+            resolved: None,
+        };
+        let parsed = parse_command(&data).expect("valid hydrate command");
+        let DiscordCommand::Hydrate(command) = parsed else {
+            panic!("expected hydrate");
+        };
+        assert_eq!(command.riot_match_id, Some("NA1_5561726994".to_owned()));
     }
 }

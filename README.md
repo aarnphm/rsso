@@ -26,6 +26,7 @@ The repo uses a Cargo workspace under `crates/`, `wrangler` for Cloudflare Worke
 - `/result game_id winner`
 - `/results game_id? winner? riot_match_id? region?`
 - `/finish riot_match_id game_id? winner? region?`
+- `/hydrate game_id? riot_match_id? region?`
 - `/end game_id`
 - `/status game_id?`
 - `/stats user? mode?`
@@ -41,6 +42,8 @@ The scheduled worker runs every 3 minutes. For randomized or in-game rows, it pr
 `/results game_id? winner? riot_match_id? region?` reports a winner. If `riot_match_id` is provided and a winner is known from Riot or from the command, it finalizes rating/W-L state immediately. If `riot_match_id` is absent, it only marks the game as reported and leaves `/end` as the manual finalization gate. When a Riot match id is provided, it tries Match-V5, stores the local game to Riot match link, and writes participant stats when Riot returns match data. If Riot cannot see the match yet, it still stores the supplied match id as a manual link so it can be resolved later. `riot_match_id` accepts either `NA1_5561312307` or the numeric game id `5561312307`; numeric ids default to `region:NA`.
 
 `/finish riot_match_id game_id? winner? region?` fetches Match-V5 when the API key can see the match. It validates the match roster, derives the winner when Riot data has enough team info, writes `matches` plus `match_participants`, and finalizes rating/W-L state. Manual `winner` remains supported because Riot custom-match history is gated behind RSO for many flows. If Match-V5 returns 403, `/finish` can still close the game when `winner` is passed or the local game was already reported.
+
+`/hydrate game_id? riot_match_id? region?` retries Match-V5 for a linked game and backfills `match_participants` when Riot data becomes visible later. With no options, it targets the latest linked game in the guild. Numeric `riot_match_id` inputs use the same region normalization as `/finish`.
 
 ARAM and ARAM: Mayhem have first-class mode rows. Public ARAM queues validate against `450` and `2400`; custom games with queue `0` are accepted because in-house lobbies can report as custom queue data.
 

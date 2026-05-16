@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use rsso_discord::{DiscordCommand, FinishCommand, GameCommand, ResultsCommand};
+use rsso_discord::{DiscordCommand, FinishCommand, GameCommand, HydrateCommand, ResultsCommand};
 use rsso_domain::{
     split_even_teams, DiscordUserId, GameId, GameModeKind, GameStatus, QueueId, Rng,
     TeamAssignment, TeamSide,
@@ -137,6 +137,9 @@ pub async fn handle_command_with_resolver<
             handle_results(storage, resolver, context, command).await
         }
         DiscordCommand::Finish(command) => handle_finish(storage, resolver, context, command).await,
+        DiscordCommand::Hydrate(command) => {
+            handle_hydrate(storage, resolver, context, command).await
+        }
         DiscordCommand::End { game_id } => handle_end(storage, context, game_id).await,
         DiscordCommand::Status { game_id } => handle_status(storage, context, game_id).await,
         DiscordCommand::Stats { user, mode } => {
@@ -505,7 +508,7 @@ async fn handle_finish<S: Storage + ?Sized>(
         .map_err(|err| HandlerError::UserFacing(format!("Invalid stored mode: {err}")))?;
     let roster = storage.roster(&game_id).await?;
     let resolved_match = resolver.resolve_match(&command.riot_match_id).await?;
-    let stored_winner = game
+    let stored_winner: Option<TeamSide> = game
         .winning_side
         .as_deref()
         .map(str::parse)
@@ -562,6 +565,68 @@ async fn handle_finish<S: Storage + ?Sized>(
     ))
 }
 
+async fn handle_hydrate<S: Storage + ?Sized>(
+    storage: &S,
+    resolver: &(impl RiotMatchResolver + ?Sized),
+    context: CommandContext,
+    command: HydrateCommand,
+) -> Result<String, HandlerError> {
+    let (game_id, game, riot_match_id) = load_hydrate_target(storage, &context, command).await?;
+    let status = game
+        .status()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored status: {err}")))?;
+    if status == GameStatus::Lobby {
+        return Err(HandlerError::UserFacing(
+            "Randomize teams before hydrating match stats.".to_owned(),
+        ));
+    }
+    if status == GameStatus::Cancelled {
+        return Err(HandlerError::UserFacing(
+            "Cannot hydrate a cancelled game.".to_owned(),
+        ));
+    }
+
+    let Some(match_detail) = resolver.resolve_match(&riot_match_id).await? else {
+        return Ok(format!(
+            "{} is linked to {}, but Riot still does not return Match-V5 data for it.",
+            game_id, riot_match_id
+        ));
+    };
+
+    let mode = game
+        .mode()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored mode: {err}")))?;
+    validate_match_mode(mode, &match_detail)?;
+    let stored_winner: Option<TeamSide> = game
+        .winning_side
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|err| HandlerError::UserFacing(format!("{err}")))?;
+    let derived_winner = derive_winner(&match_detail);
+    if let (Some(stored), Some(derived)) = (stored_winner, derived_winner) {
+        if stored != derived {
+            return Err(HandlerError::UserFacing(format!(
+                "Riot winner {} conflicts with stored winner {} for {}.",
+                derived.as_str(),
+                stored.as_str(),
+                game_id
+            )));
+        }
+    }
+
+    let roster = storage.roster(&game_id).await?;
+    let match_record = build_match_record(&game, &roster, match_detail)?;
+    let participant_count = match_record.participants.len();
+    storage
+        .record_match(&game_id, match_record, context.now)
+        .await?;
+    Ok(format!(
+        "{} hydrated from {} with {} participant row(s).",
+        game_id, riot_match_id, participant_count
+    ))
+}
+
 async fn handle_end<S: Storage + ?Sized>(
     storage: &S,
     context: CommandContext,
@@ -588,6 +653,56 @@ async fn handle_end<S: Storage + ?Sized>(
         .finalize_game(&game_id, winner, game.riot_match_id.as_deref(), context.now)
         .await?;
     Ok(format!("{} finalized as {} win.", game_id, winner.as_str()))
+}
+
+async fn load_hydrate_target<S: Storage + ?Sized>(
+    storage: &S,
+    context: &CommandContext,
+    command: HydrateCommand,
+) -> Result<(GameId, GameRow, String), HandlerError> {
+    match (command.game_id, command.riot_match_id) {
+        (Some(game_id), Some(riot_match_id)) => {
+            let game = storage.game_by_id(&game_id).await?;
+            ensure_game_in_guild(&game, &context.guild_id)?;
+            Ok((game_id, game, riot_match_id))
+        }
+        (Some(game_id), None) => {
+            let game = storage.game_by_id(&game_id).await?;
+            ensure_game_in_guild(&game, &context.guild_id)?;
+            let riot_match_id = game.riot_match_id.clone().ok_or_else(|| {
+                HandlerError::UserFacing(format!("{game_id} has no Riot match id yet."))
+            })?;
+            Ok((game_id, game, riot_match_id))
+        }
+        (None, Some(riot_match_id)) => {
+            let game = storage
+                .game_by_riot_match_id(&context.guild_id, &riot_match_id)
+                .await?
+                .ok_or_else(|| {
+                    HandlerError::UserFacing(format!(
+                        "No local game is linked to {riot_match_id}; pass `game_id` too."
+                    ))
+                })?;
+            let game_id = GameId::new(game.game_id.clone());
+            Ok((game_id, game, riot_match_id))
+        }
+        (None, None) => {
+            let game = storage
+                .latest_game_with_match_for_guild(&context.guild_id)
+                .await?
+                .ok_or_else(|| {
+                    HandlerError::UserFacing(
+                        "No linked game found to hydrate; pass `game_id` or `riot_match_id`."
+                            .to_owned(),
+                    )
+                })?;
+            let game_id = GameId::new(game.game_id.clone());
+            let riot_match_id = game.riot_match_id.clone().ok_or_else(|| {
+                HandlerError::UserFacing(format!("{game_id} has no Riot match id yet."))
+            })?;
+            Ok((game_id, game, riot_match_id))
+        }
+    }
 }
 
 async fn handle_status<S: Storage + ?Sized>(
@@ -627,11 +742,21 @@ async fn load_game_for_guild<S: Storage + ?Sized>(
         }
     };
     if game.guild_id != guild_id {
-        return Err(HandlerError::UserFacing(
-            "That game belongs to a different guild.".to_owned(),
-        ));
+        return Err(wrong_guild_error());
     }
     Ok((game_id, game))
+}
+
+fn ensure_game_in_guild(game: &GameRow, guild_id: &str) -> Result<(), HandlerError> {
+    if game.guild_id == guild_id {
+        Ok(())
+    } else {
+        Err(wrong_guild_error())
+    }
+}
+
+fn wrong_guild_error() -> HandlerError {
+    HandlerError::UserFacing("That game belongs to a different guild.".to_owned())
 }
 
 fn derive_winner(match_detail: &ResolvedRiotMatch) -> Option<TeamSide> {

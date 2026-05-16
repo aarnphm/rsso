@@ -225,6 +225,15 @@ fn command_manifest() -> serde_json::Value {
             ]
         },
         {
+            "name": "hydrate",
+            "description": "Backfill Riot participant stats for a linked game",
+            "options": [
+                {"name": "game_id", "description": "Local game id", "type": 3, "required": false},
+                {"name": "riot_match_id", "description": "Riot match id or numeric Riot game id", "type": 3, "required": false},
+                {"name": "region", "description": "Region for numeric Riot game id", "type": 3, "required": false, "choices": region_choices()}
+            ]
+        },
+        {
             "name": "end",
             "description": "Finalize a reported game",
             "options": [

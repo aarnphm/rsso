@@ -75,7 +75,20 @@ When `winner` and `riot_match_id` are both present, the game finalizes immediate
 
 `/finish` is the direct finalization path. Use it when the Riot match id is known and the game should close immediately. If `game_id` is omitted, the bot uses the current open game for the guild. If Match-V5 cannot derive a winner or returns 403, pass `winner`; if the game was already reported, `/finish` can reuse the stored winner. If no winner is available, `/finish` still links the Riot match id and tells you to rerun it with `winner`.
 
-8. Read stats:
+8. Hydrate missing Riot stats:
+
+```text
+/hydrate
+/hydrate riot_match_id:5561312307
+/hydrate game_id:g_abc123
+/hydrate game_id:g_abc123 riot_match_id:5561312307 region:NA
+```
+
+`/hydrate` retries Match-V5 and backfills `matches` plus `match_participants` for a linked local game. With no options, it targets the latest linked game in the guild. With a numeric `riot_match_id`, it defaults to `region:NA`, so `5561312307` becomes `NA1_5561312307`.
+
+Hydration does not change ratings or W/L. It only fills the missing Riot payload so champion, KDA, damage, gold, minion, and vision stats can appear in stats views. If Riot still returns 403 or 404, the bot leaves the existing manual link alone and reports that Match-V5 data is still unavailable.
+
+9. Read stats:
 
 ```text
 /stats
@@ -94,6 +107,7 @@ Stats and leaderboards count finalized games. Champion and damage averages depen
 - The scheduled Worker runs every 3 minutes and links `game_id` to `riot_match_id` when Spectator-V5 sees a registered PUUID in an active game.
 - `/results riot_match_id:... winner:...` links a Riot match id after the fact and finalizes ratings.
 - `/finish riot_match_id:...` links the Riot match id and finalizes the game in one command.
+- `/hydrate` retries a linked Riot match id and backfills participant stats when Match-V5 becomes visible.
 - `/status` shows the current link state.
 
 ## Operator Commands

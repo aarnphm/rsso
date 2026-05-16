@@ -20,6 +20,10 @@ crons = ["*/3 * * * *"]
 RIOT_PLATFORM_DEFAULT = "NA1"
 RIOT_REGIONAL_DEFAULT = "AMERICAS"
 
+[observability.logs]
+enabled = false
+invocation_logs = true
+
 # Secrets:
 #   DISCORD_PUBLIC_KEY
 #   DISCORD_BOT_TOKEN

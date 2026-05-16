@@ -1,12 +1,13 @@
 use async_trait::async_trait;
-use rsso_discord::{DiscordCommand, FinishCommand, GameCommand};
+use rsso_discord::{DiscordCommand, FinishCommand, GameCommand, ResultsCommand};
 use rsso_domain::{
     split_even_teams, DiscordUserId, GameId, GameModeKind, GameStatus, QueueId, Rng,
     TeamAssignment, TeamSide,
 };
 use rsso_riot::parse_riot_id;
 use rsso_storage::{
-    MatchRecord, NewGame, NewPlayer, ParticipantRecord, RosterPlayer, Storage, StorageError,
+    GameRow, MatchRecord, NewGame, NewPlayer, ParticipantRecord, RosterPlayer, Storage,
+    StorageError,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -132,8 +133,12 @@ pub async fn handle_command_with_resolver<
         DiscordCommand::Result { game_id, winner } => {
             handle_result(storage, context, game_id, winner).await
         }
+        DiscordCommand::Results(command) => {
+            handle_results(storage, resolver, context, command).await
+        }
         DiscordCommand::Finish(command) => handle_finish(storage, resolver, context, command).await,
         DiscordCommand::End { game_id } => handle_end(storage, context, game_id).await,
+        DiscordCommand::Status { game_id } => handle_status(storage, context, game_id).await,
         DiscordCommand::Stats { user, mode } => {
             let user = user.unwrap_or_else(|| DiscordUserId::new(context.actor_id.clone()));
             let stats = storage
@@ -282,7 +287,7 @@ async fn handle_game<S: Storage + ?Sized>(
         ));
     }
     Ok(format!(
-        "Created {} in {} with {} players. Add one more player before randomizing.",
+        "Created {} in {} with {} players. Add one more player before randomizing. Riot match id is pending until Spectator sees the live game.",
         game_id,
         command.mode.as_str(),
         user_ids.len()
@@ -386,47 +391,149 @@ async fn handle_result<S: Storage + ?Sized>(
     ))
 }
 
+async fn handle_results<S: Storage + ?Sized>(
+    storage: &S,
+    resolver: &(impl RiotMatchResolver + ?Sized),
+    context: CommandContext,
+    command: ResultsCommand,
+) -> Result<String, HandlerError> {
+    if command.winner.is_none() && command.riot_match_id.is_none() {
+        return Err(HandlerError::UserFacing(
+            "`/results` needs `winner`, `riot_match_id`, or both.".to_owned(),
+        ));
+    }
+    let (game_id, game) = load_game_for_guild(
+        storage,
+        &context.guild_id,
+        command.game_id.clone(),
+        "No open game to report.",
+    )
+    .await?;
+    let status = game
+        .status()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored status: {err}")))?;
+    if status == GameStatus::Lobby {
+        return Err(HandlerError::UserFacing(
+            "Randomize teams before reporting results.".to_owned(),
+        ));
+    }
+    if matches!(status, GameStatus::Finalized | GameStatus::Cancelled) {
+        return Err(HandlerError::UserFacing(
+            "That game is already closed.".to_owned(),
+        ));
+    }
+
+    let mode = game
+        .mode()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored mode: {err}")))?;
+    let roster = storage.roster(&game_id).await?;
+    let mut linked_match_id = None;
+    let mut derived_winner = None;
+
+    if let Some(riot_match_id) = command.riot_match_id.as_deref() {
+        let resolved_match = resolver.resolve_match(riot_match_id).await?;
+        if let Some(match_detail) = resolved_match {
+            validate_match_mode(mode, &match_detail)?;
+            derived_winner = derive_winner(&match_detail);
+            let match_record = build_match_record(&game, &roster, match_detail)?;
+            linked_match_id = Some(match_record.riot_match_id.clone());
+            storage
+                .record_match(&game_id, match_record, context.now)
+                .await?;
+        } else {
+            linked_match_id = Some(riot_match_id.to_owned());
+            storage
+                .record_match(
+                    &game_id,
+                    manual_match_record(&context.guild_id, mode, riot_match_id),
+                    context.now,
+                )
+                .await?;
+        }
+    }
+
+    let Some(winner) = command.winner.or(derived_winner) else {
+        let match_id = linked_match_id.ok_or_else(|| {
+            HandlerError::UserFacing("`/results` needs a winner to report.".to_owned())
+        })?;
+        return Ok(format!(
+            "{} linked to {}. Riot did not return a winner yet, so the game is not reported. Run `/results game_id:{} winner:Blue` or `/results game_id:{} winner:Red` once the winner is known.",
+            game_id, match_id, game_id, game_id
+        ));
+    };
+
+    storage
+        .record_vote(&game_id, &context.actor_id, winner, context.now)
+        .await?;
+
+    if let Some(match_id) = linked_match_id {
+        storage
+            .finalize_game(&game_id, winner, Some(&match_id), context.now)
+            .await?;
+        return Ok(format!(
+            "{} finalized from {} as {} win.",
+            game_id,
+            match_id,
+            winner.as_str()
+        ));
+    }
+
+    storage.mark_reported(&game_id, winner, context.now).await?;
+    Ok(format!(
+        "{} reported as {} win. Use `/end {}` to finalize.",
+        game_id,
+        winner.as_str(),
+        game_id
+    ))
+}
+
 async fn handle_finish<S: Storage + ?Sized>(
     storage: &S,
     resolver: &(impl RiotMatchResolver + ?Sized),
     context: CommandContext,
     command: FinishCommand,
 ) -> Result<String, HandlerError> {
-    let (game_id, game) = match command.game_id.clone() {
-        Some(game_id) => {
-            let game = storage.game_by_id(&game_id).await?;
-            (game_id, game)
-        }
-        None => {
-            let game = storage
-                .open_game_for_guild(&context.guild_id)
-                .await?
-                .ok_or_else(|| HandlerError::UserFacing("No open game to finish.".to_owned()))?;
-            (GameId::new(game.game_id.clone()), game)
-        }
-    };
-    if game.guild_id != context.guild_id {
-        return Err(HandlerError::UserFacing(
-            "That game belongs to a different guild.".to_owned(),
-        ));
-    }
+    let (game_id, game) = load_game_for_guild(
+        storage,
+        &context.guild_id,
+        command.game_id.clone(),
+        "No open game to finish.",
+    )
+    .await?;
     let mode = game
         .mode()
         .map_err(|err| HandlerError::UserFacing(format!("Invalid stored mode: {err}")))?;
     let roster = storage.roster(&game_id).await?;
     let resolved_match = resolver.resolve_match(&command.riot_match_id).await?;
-    let winner = match (command.winner, resolved_match.as_ref()) {
-        (Some(winner), _) => winner,
-        (None, Some(match_detail)) => derive_winner(match_detail).ok_or_else(|| {
+    let stored_winner = game
+        .winning_side
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|err| HandlerError::UserFacing(format!("{err}")))?;
+    let winner = match (command.winner, resolved_match.as_ref(), stored_winner) {
+        (Some(winner), _, _) => winner,
+        (None, Some(match_detail), _) => derive_winner(match_detail).ok_or_else(|| {
             HandlerError::UserFacing(
                 "Could not derive winner from Riot match data; pass `winner` explicitly."
                     .to_owned(),
             )
         })?,
-        (None, None) => {
+        (None, None, Some(winner)) => winner,
+        (None, None, None) => {
+            storage
+                .record_match(
+                    &game_id,
+                    manual_match_record(&context.guild_id, mode, &command.riot_match_id),
+                    context.now,
+                )
+                .await?;
             return Err(HandlerError::UserFacing(
-                "`/finish` needs `winner` until Riot returns match data for that ID.".to_owned(),
-            ))
+                format!(
+                    "{} linked to {}. Riot did not return match data, so `/finish` needs `winner:Blue` or `winner:Red`.",
+                    game_id, command.riot_match_id
+                ),
+            ));
         }
     };
     if let Some(match_detail) = resolved_match {
@@ -439,18 +546,7 @@ async fn handle_finish<S: Storage + ?Sized>(
         storage
             .record_match(
                 &game_id,
-                MatchRecord {
-                    riot_match_id: command.riot_match_id.clone(),
-                    guild_id: context.guild_id.clone(),
-                    mode,
-                    queue_id: None,
-                    map_id: None,
-                    riot_game_mode: None,
-                    riot_game_type: None,
-                    data_source: "manual".to_owned(),
-                    payload_json: None,
-                    participants: Vec::new(),
-                },
+                manual_match_record(&context.guild_id, mode, &command.riot_match_id),
                 context.now,
             )
             .await?;
@@ -472,6 +568,11 @@ async fn handle_end<S: Storage + ?Sized>(
     game_id: GameId,
 ) -> Result<String, HandlerError> {
     let game = storage.game_by_id(&game_id).await?;
+    if game.guild_id != context.guild_id {
+        return Err(HandlerError::UserFacing(
+            "That game belongs to a different guild.".to_owned(),
+        ));
+    }
     if game.creator_discord_id != context.actor_id {
         return Err(HandlerError::UserFacing(
             "Only the game creator can end this game for now.".to_owned(),
@@ -487,6 +588,50 @@ async fn handle_end<S: Storage + ?Sized>(
         .finalize_game(&game_id, winner, game.riot_match_id.as_deref(), context.now)
         .await?;
     Ok(format!("{} finalized as {} win.", game_id, winner.as_str()))
+}
+
+async fn handle_status<S: Storage + ?Sized>(
+    storage: &S,
+    context: CommandContext,
+    game_id: Option<GameId>,
+) -> Result<String, HandlerError> {
+    let (game_id, game) =
+        load_game_for_guild(storage, &context.guild_id, game_id, "No open game found.").await?;
+    let riot_link = game.riot_match_id.as_deref().map_or_else(
+        || "Riot match id: pending until Spectator sees the live game".to_owned(),
+        |match_id| format!("Riot match id: {match_id}"),
+    );
+    Ok(format!(
+        "{}: mode {}, status {}, {}",
+        game_id, game.mode, game.status, riot_link
+    ))
+}
+
+async fn load_game_for_guild<S: Storage + ?Sized>(
+    storage: &S,
+    guild_id: &str,
+    game_id: Option<GameId>,
+    no_open_message: &'static str,
+) -> Result<(GameId, GameRow), HandlerError> {
+    let (game_id, game) = match game_id {
+        Some(game_id) => {
+            let game = storage.game_by_id(&game_id).await?;
+            (game_id, game)
+        }
+        None => {
+            let game = storage
+                .open_game_for_guild(guild_id)
+                .await?
+                .ok_or_else(|| HandlerError::UserFacing(no_open_message.to_owned()))?;
+            (GameId::new(game.game_id.clone()), game)
+        }
+    };
+    if game.guild_id != guild_id {
+        return Err(HandlerError::UserFacing(
+            "That game belongs to a different guild.".to_owned(),
+        ));
+    }
+    Ok((game_id, game))
 }
 
 fn derive_winner(match_detail: &ResolvedRiotMatch) -> Option<TeamSide> {
@@ -516,7 +661,7 @@ fn validate_match_mode(
 }
 
 fn build_match_record(
-    game: &rsso_storage::GameRow,
+    game: &GameRow,
     roster: &[RosterPlayer],
     match_detail: ResolvedRiotMatch,
 ) -> Result<MatchRecord, HandlerError> {
@@ -582,6 +727,21 @@ fn build_match_record(
         payload_json: match_detail.payload_json,
         participants,
     })
+}
+
+fn manual_match_record(guild_id: &str, mode: GameModeKind, riot_match_id: &str) -> MatchRecord {
+    MatchRecord {
+        riot_match_id: riot_match_id.to_owned(),
+        guild_id: guild_id.to_owned(),
+        mode,
+        queue_id: None,
+        map_id: None,
+        riot_game_mode: None,
+        riot_game_type: None,
+        data_source: "manual".to_owned(),
+        payload_json: None,
+        participants: Vec::new(),
+    }
 }
 
 fn side_from_team_id(team_id: Option<u16>) -> Option<TeamSide> {

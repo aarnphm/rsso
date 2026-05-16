@@ -1,5 +1,7 @@
 use crate::interaction::{ApplicationCommandData, CommandOption};
-use rsso_domain::{parse_riot_match_id, DiscordUserId, GameId, GameModeKind, TeamSide};
+use rsso_domain::{
+    normalize_riot_match_id, DiscordUserId, GameId, GameModeKind, MatchIdError, TeamSide,
+};
 use serde_json::Value;
 use std::str::FromStr;
 use thiserror::Error;
@@ -21,9 +23,13 @@ pub enum DiscordCommand {
         game_id: GameId,
         winner: TeamSide,
     },
+    Results(ResultsCommand),
     Finish(FinishCommand),
     End {
         game_id: GameId,
+    },
+    Status {
+        game_id: Option<GameId>,
     },
     Stats {
         user: Option<DiscordUserId>,
@@ -48,6 +54,13 @@ pub struct FinishCommand {
     pub riot_match_id: String,
     pub game_id: Option<GameId>,
     pub winner: Option<TeamSide>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultsCommand {
+    pub game_id: Option<GameId>,
+    pub winner: Option<TeamSide>,
+    pub riot_match_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -85,9 +98,13 @@ pub fn parse_command(data: &ApplicationCommandData) -> Result<DiscordCommand, Co
             game_id: GameId::new(string_option(&data.options, "game_id")?),
             winner: team_option(&data.options, "winner")?,
         }),
+        "results" => parse_results(data),
         "finish" => parse_finish(data),
         "end" => Ok(DiscordCommand::End {
             game_id: GameId::new(string_option(&data.options, "game_id")?),
+        }),
+        "status" => Ok(DiscordCommand::Status {
+            game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
         }),
         "stats" => Ok(DiscordCommand::Stats {
             user: optional_user_option(&data.options, "user")?,
@@ -118,16 +135,63 @@ fn parse_game(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandEr
 }
 
 fn parse_finish(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
-    let riot_match_id = string_option(&data.options, "riot_match_id")?.to_owned();
-    parse_riot_match_id(&riot_match_id).map_err(|err| CommandError::InvalidOption {
-        name: "riot_match_id",
-        reason: err.to_string(),
-    })?;
+    let riot_match_id = normalize_match_id_option(&data.options, "riot_match_id")?;
     Ok(DiscordCommand::Finish(FinishCommand {
         riot_match_id,
         game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
         winner: optional_team_option(&data.options, "winner")?,
     }))
+}
+
+fn parse_results(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
+    let riot_match_id = optional_normalize_match_id_option(&data.options, "riot_match_id")?;
+    Ok(DiscordCommand::Results(ResultsCommand {
+        game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
+        winner: optional_team_option(&data.options, "winner")?,
+        riot_match_id,
+    }))
+}
+
+fn normalize_match_id_option(
+    options: &[CommandOption],
+    name: &'static str,
+) -> Result<String, CommandError> {
+    normalize_match_id(
+        string_option(options, name)?,
+        optional_string_option(options, "region")?,
+        name,
+    )
+}
+
+fn optional_normalize_match_id_option(
+    options: &[CommandOption],
+    name: &'static str,
+) -> Result<Option<String>, CommandError> {
+    let region = optional_string_option(options, "region")?;
+    let Some(value) = optional_string_option(options, name)? else {
+        if region.is_some() {
+            return Err(CommandError::InvalidOption {
+                name: "region",
+                reason: "`region` only applies when `riot_match_id` is set".to_owned(),
+            });
+        }
+        return Ok(None);
+    };
+    normalize_match_id(value, region, name).map(Some)
+}
+
+fn normalize_match_id(
+    value: &str,
+    region: Option<&str>,
+    name: &'static str,
+) -> Result<String, CommandError> {
+    normalize_riot_match_id(value, region).map_err(|err| CommandError::InvalidOption {
+        name: match &err {
+            MatchIdError::UnknownRegion(_) | MatchIdError::RegionMismatch { .. } => "region",
+            _ => name,
+        },
+        reason: err.to_string(),
+    })
 }
 
 fn string_option<'a>(
@@ -305,5 +369,60 @@ mod tests {
             panic!("expected finish");
         };
         assert_eq!(command.winner, Some(TeamSide::Blue));
+    }
+
+    #[test]
+    fn parses_finish_numeric_game_id_with_region() {
+        let data = ApplicationCommandData {
+            name: "finish".to_owned(),
+            options: vec![
+                CommandOption {
+                    name: "riot_match_id".to_owned(),
+                    value: Some(json!("5561312307")),
+                    options: vec![],
+                },
+                CommandOption {
+                    name: "region".to_owned(),
+                    value: Some(json!("NA")),
+                    options: vec![],
+                },
+            ],
+            resolved: None,
+        };
+        let parsed = parse_command(&data).expect("valid finish command");
+        let DiscordCommand::Finish(command) = parsed else {
+            panic!("expected finish");
+        };
+        assert_eq!(command.riot_match_id, "NA1_5561312307");
+    }
+
+    #[test]
+    fn parses_results_with_optional_match_id() {
+        let data = ApplicationCommandData {
+            name: "results".to_owned(),
+            options: vec![
+                CommandOption {
+                    name: "game_id".to_owned(),
+                    value: Some(json!("g_123")),
+                    options: vec![],
+                },
+                CommandOption {
+                    name: "riot_match_id".to_owned(),
+                    value: Some(json!("NA1_4901234567")),
+                    options: vec![],
+                },
+            ],
+            resolved: None,
+        };
+        let parsed = parse_command(&data).expect("valid results command");
+        let DiscordCommand::Results(command) = parsed else {
+            panic!("expected results");
+        };
+        assert_eq!(
+            command.game_id.map(|id| id.into_inner()),
+            Some("g_123".to_owned())
+        );
+        assert_eq!(command.winner, None);
+        assert_eq!(command.riot_match_id, Some("NA1_4901234567".to_owned()));
     }
 }

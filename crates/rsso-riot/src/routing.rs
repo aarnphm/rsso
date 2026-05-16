@@ -40,6 +40,18 @@ pub fn platform_host(route: &str) -> Result<&'static str, RiotRouteError> {
     }
 }
 
+pub fn match_regional_route_for_platform(
+    platform_route: &str,
+) -> Result<&'static str, RiotRouteError> {
+    match platform_route.to_ascii_uppercase().as_str() {
+        "BR1" | "LA1" | "LA2" | "NA1" => Ok("AMERICAS"),
+        "EUN1" | "EUW1" | "RU" | "TR1" => Ok("EUROPE"),
+        "JP1" | "KR" => Ok("ASIA"),
+        "OC1" | "PH2" | "SG2" | "TH2" | "TW2" | "VN2" => Ok("SEA"),
+        other => Err(RiotRouteError::UnknownPlatform(other.to_owned())),
+    }
+}
+
 pub fn account_by_riot_id_url(
     regional_route: &str,
     game_name: &str,
@@ -94,5 +106,43 @@ pub fn active_game_url(platform_route: &str, puuid: &str) -> Result<String, Riot
 }
 
 fn urlencoding(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte))
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::routing::{account_by_riot_id_url, match_regional_route_for_platform};
+
+    #[test]
+    fn path_encoding_uses_percent_spaces() {
+        let url = account_by_riot_id_url("AMERICAS", "must trust a", "fart")
+            .expect("valid regional route");
+        assert!(url.ends_with("/must%20trust%20a/fart"));
+    }
+
+    #[test]
+    fn maps_match_platform_to_regional_route() {
+        assert_eq!(
+            match_regional_route_for_platform("NA1").expect("known platform"),
+            "AMERICAS"
+        );
+        assert_eq!(
+            match_regional_route_for_platform("EUW1").expect("known platform"),
+            "EUROPE"
+        );
+    }
 }

@@ -11,7 +11,9 @@ pub use ids::{
     ChannelId, DiscordUserId, GameId, GuildId, Puuid, RiotMatchId, RiotPlatform, RiotRegional,
     RoundId,
 };
-pub use match_id::{parse_riot_match_id, MatchIdError};
+pub use match_id::{
+    normalize_riot_match_id, normalize_riot_platform, parse_riot_match_id, MatchIdError,
+};
 pub use modes::{GameModeKind, QueueId};
 pub use shuffle::{fisher_yates, split_even_teams, Rng, ShuffleError, TeamAssignment};
 pub use state::{GameStatus, StateError, TeamSide};

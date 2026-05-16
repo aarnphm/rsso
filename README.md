@@ -4,7 +4,7 @@ Discord-native League of Legends in-house tracking.
 
 The first version is API-key-first: Discord users claim a Riot ID, the bot tracks one active game per guild, teams are randomized with a Fisher-Yates shuffle, and stats are stored by local game/mode. RSO and Tournament API support are later upgrades that should fill the same schema instead of replacing it.
 
-There is intentionally no `pyproject.toml` or Python helper package here. The repo uses a Cargo workspace under `crates/`, `wrangler` for Cloudflare Workers, and D1 migrations under `migrations/`.
+The repo uses a Cargo workspace under `crates/`, `wrangler` for Cloudflare Workers, and D1 migrations under `migrations/`.
 
 ## Shape
 
@@ -24,8 +24,10 @@ There is intentionally no `pyproject.toml` or Python helper package here. The re
 - `/add game_id user`
 - `/randomize game_id`
 - `/result game_id winner`
-- `/finish riot_match_id game_id? winner?`
+- `/results game_id? winner? riot_match_id? region?`
+- `/finish riot_match_id game_id? winner? region?`
 - `/end game_id`
+- `/status game_id?`
 - `/stats user? mode?`
 - `/leaderboards mode?`
 - `/analysis mode?`
@@ -36,9 +38,13 @@ There is intentionally no `pyproject.toml` or Python helper package here. The re
 
 The scheduled worker runs every 3 minutes. For randomized or in-game rows, it probes Spectator-V5 by the first roster PUUID, validates that every known roster PUUID appears in the returned live game, validates the queue against the requested local mode, then marks the game `ingame` with the live Riot match id. Two consecutive Spectator 404s after `ingame` trigger a Match-V5 fetch; if Riot returns a valid roster and winner, the worker stores participant stats and finalizes automatically. If Match-V5 cannot see the match yet, the game stays on the manual `/end` or `/finish` path.
 
-`/finish riot_match_id game_id? winner?` fetches Match-V5 when the API key can see the match. It validates the match roster, derives the winner when Riot data has enough team info, writes `matches` plus `match_participants`, and finalizes rating/W-L state. Manual `winner` remains supported because Riot custom-match history is gated behind RSO for many flows.
+`/results game_id? winner? riot_match_id? region?` reports a winner. If `riot_match_id` is provided and a winner is known from Riot or from the command, it finalizes rating/W-L state immediately. If `riot_match_id` is absent, it only marks the game as reported and leaves `/end` as the manual finalization gate. When a Riot match id is provided, it tries Match-V5, stores the local game to Riot match link, and writes participant stats when Riot returns match data. If Riot cannot see the match yet, it still stores the supplied match id as a manual link so it can be resolved later. `riot_match_id` accepts either `NA1_5561312307` or the numeric game id `5561312307`; numeric ids default to `region:NA`.
+
+`/finish riot_match_id game_id? winner? region?` fetches Match-V5 when the API key can see the match. It validates the match roster, derives the winner when Riot data has enough team info, writes `matches` plus `match_participants`, and finalizes rating/W-L state. Manual `winner` remains supported because Riot custom-match history is gated behind RSO for many flows. If Match-V5 returns 403, `/finish` can still close the game when `winner` is passed or the local game was already reported.
 
 ARAM and ARAM: Mayhem have first-class mode rows. Public ARAM queues validate against `450` and `2400`; custom games with queue `0` are accepted because in-house lobbies can report as custom queue data.
+
+For the full Discord workflow, see [docs/commands.md](docs/commands.md).
 
 ## Cloudflare Setup
 

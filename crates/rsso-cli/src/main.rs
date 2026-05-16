@@ -96,7 +96,11 @@ async fn handle_discord(command: DiscordCommand) -> Result<()> {
             );
             let response = reqwest::Client::new()
                 .put(url)
-                .bearer_auth(bot_token)
+                .header("Authorization", format!("Bot {bot_token}"))
+                .header(
+                    "User-Agent",
+                    "DiscordBot (https://github.com/aarnphm/rsso, 0.1.0)",
+                )
                 .json(&command_manifest())
                 .send()
                 .await
@@ -183,10 +187,9 @@ fn command_manifest() -> serde_json::Value {
             ]
         },
         {
-            "name": "finish",
-            "description": "Finalize a game from a Riot match id",
+            "name": "results",
+            "description": "Report a result and optionally link Riot match data",
             "options": [
-                {"name": "riot_match_id", "description": "Riot match id, for example NA1_4901234567", "type": 3, "required": true},
                 {"name": "game_id", "description": "Local game id", "type": 3, "required": false},
                 {
                     "name": "winner",
@@ -197,7 +200,28 @@ fn command_manifest() -> serde_json::Value {
                         {"name": "Blue", "value": "blue"},
                         {"name": "Red", "value": "red"}
                     ]
-                }
+                },
+                {"name": "riot_match_id", "description": "Riot match id or numeric Riot game id", "type": 3, "required": false},
+                {"name": "region", "description": "Region for numeric Riot game id", "type": 3, "required": false, "choices": region_choices()}
+            ]
+        },
+        {
+            "name": "finish",
+            "description": "Finalize a game from a Riot match id",
+            "options": [
+                {"name": "riot_match_id", "description": "Riot match id or numeric Riot game id", "type": 3, "required": true},
+                {"name": "game_id", "description": "Local game id", "type": 3, "required": false},
+                {
+                    "name": "winner",
+                    "description": "Winning side",
+                    "type": 3,
+                    "required": false,
+                    "choices": [
+                        {"name": "Blue", "value": "blue"},
+                        {"name": "Red", "value": "red"}
+                    ]
+                },
+                {"name": "region", "description": "Region for numeric Riot game id", "type": 3, "required": false, "choices": region_choices()}
             ]
         },
         {
@@ -205,6 +229,13 @@ fn command_manifest() -> serde_json::Value {
             "description": "Finalize a reported game",
             "options": [
                 {"name": "game_id", "description": "Local game id", "type": 3, "required": true}
+            ]
+        },
+        {
+            "name": "status",
+            "description": "Show the local to Riot match link for a game",
+            "options": [
+                {"name": "game_id", "description": "Local game id", "type": 3, "required": false}
             ]
         },
         {
@@ -238,5 +269,26 @@ fn mode_choices() -> serde_json::Value {
         {"name": "ARAM", "value": "aram"},
         {"name": "ARAM: Mayhem", "value": "aram_mayhem"},
         {"name": "Other", "value": "other"}
+    ])
+}
+
+fn region_choices() -> serde_json::Value {
+    serde_json::json!([
+        {"name": "NA", "value": "NA"},
+        {"name": "BR", "value": "BR"},
+        {"name": "LAN", "value": "LAN"},
+        {"name": "LAS", "value": "LAS"},
+        {"name": "EUW", "value": "EUW"},
+        {"name": "EUNE", "value": "EUNE"},
+        {"name": "KR", "value": "KR"},
+        {"name": "JP", "value": "JP"},
+        {"name": "OCE", "value": "OCE"},
+        {"name": "TR", "value": "TR"},
+        {"name": "RU", "value": "RU"},
+        {"name": "PH", "value": "PH"},
+        {"name": "SG", "value": "SG"},
+        {"name": "TH", "value": "TH"},
+        {"name": "TW", "value": "TW"},
+        {"name": "VN", "value": "VN"}
     ])
 }

@@ -8,12 +8,15 @@ mod worker_entry {
     use rsso_discord::interaction::InteractionType;
     use rsso_discord::response::{deferred_response, message_response, pong_response};
     use rsso_discord::{parse_command, verify::verify_discord_request, Interaction};
-    use rsso_domain::Rng;
+    use rsso_domain::{parse_riot_match_id, Rng};
     use rsso_handlers::{
         handle_command_with_resolver, CommandContext, HandlerError, ResolvedRiotAccount,
         ResolvedRiotMatch, ResolvedRiotParticipant, RiotAccountResolver, RiotMatchResolver,
     };
-    use rsso_riot::routing::{account_by_riot_id_url, active_game_url, match_detail_url};
+    use rsso_riot::routing::{
+        account_by_riot_id_url, active_game_url, match_detail_url,
+        match_regional_route_for_platform,
+    };
     use rsso_storage::d1::D1Storage;
     use worker::{
         event, Context, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result,
@@ -276,7 +279,15 @@ mod worker_entry {
             let Some(api_key) = self.api_key.as_deref() else {
                 return Ok(None);
             };
-            let url = match_detail_url(&self.regional_route, riot_match_id)
+            let regional_route = parse_riot_match_id(riot_match_id)
+                .ok()
+                .and_then(|match_id| {
+                    match_regional_route_for_platform(&match_id.platform)
+                        .ok()
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| self.regional_route.clone());
+            let url = match_detail_url(&regional_route, riot_match_id)
                 .map_err(|err| HandlerError::UserFacing(format!("Riot route error: {err}")))?;
             let headers = Headers::new();
             headers
@@ -333,7 +344,7 @@ mod worker_entry {
                         participants,
                     }))
                 }
-                404 => Ok(None),
+                403 | 404 => Ok(None),
                 status => Err(HandlerError::UserFacing(format!(
                     "Riot match lookup failed with HTTP {status}"
                 ))),

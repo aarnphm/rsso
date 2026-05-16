@@ -1,0 +1,5 @@
+[alias]
+ci = "clippy --all --benches --tests --examples --all-features"
+
+[build]
+target-dir = "target"

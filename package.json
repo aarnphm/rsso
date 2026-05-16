@@ -1,0 +1,14 @@
+{
+  "name": "rsso",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "d1:local": "wrangler d1 migrations apply DB --local",
+    "d1:remote": "wrangler d1 migrations apply DB --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.15.2"
+  }
+}

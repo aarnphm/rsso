@@ -1,0 +1,8 @@
+target
+node_modules
+.wrangler
+build
+.env
+.dev.vars
+!migrations/
+!migrations/*.sql

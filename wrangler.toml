@@ -1,0 +1,26 @@
+name = "rsso"
+main = "crates/rsso-worker/build/worker/shim.mjs"
+compatibility_date = "2026-05-16"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+cwd = "crates/rsso-worker"
+watch_dir = "crates"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rsso-dev"
+database_id = "8f2de50b-3317-480b-85e4-7c83706c8967"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["*/3 * * * *"]
+
+[vars]
+RIOT_PLATFORM_DEFAULT = "NA1"
+RIOT_REGIONAL_DEFAULT = "AMERICAS"
+
+# Secrets:
+#   DISCORD_PUBLIC_KEY
+#   DISCORD_BOT_TOKEN
+#   RIOT_API_KEY

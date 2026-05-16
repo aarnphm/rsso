@@ -1,0 +1,19 @@
+[package]
+name = "rsso-handlers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+nanoid.workspace = true
+rsso-discord.workspace = true
+rsso-domain.workspace = true
+rsso-riot.workspace = true
+rsso-storage.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

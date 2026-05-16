@@ -1,0 +1,16 @@
+[package]
+name = "rsso-riot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+rsso-domain.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

@@ -29,11 +29,27 @@ mod worker_entry {
 
         match (req.method(), req.path().as_str()) {
             (Method::Get, "/healthz") => Response::ok("ok"),
+            (Method::Get | Method::Head, "/riot.txt") => riot_txt_response(),
             (Method::Post, "/interactions" | "/discord/interactions") => {
                 handle_interaction(&mut req, env, ctx).await
             }
             _ => Response::error("not found", 404),
         }
+    }
+
+    fn riot_txt_response() -> Result<Response> {
+        let Some(value) = option_env!("RIOT_TXT")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Response::error("riot.txt is not configured", 404);
+        };
+        let mut response = Response::ok(format!("{value}\n"))?;
+        response
+            .headers_mut()
+            .set("Content-Type", "text/plain; charset=utf-8")?;
+        response.headers_mut().set("Cache-Control", "no-store")?;
+        Ok(response)
     }
 
     #[event(scheduled)]

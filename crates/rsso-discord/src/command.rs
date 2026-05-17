@@ -8,46 +8,46 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscordCommand {
-    RegisterSummoners {
-        riot_id: String,
-    },
+    RegisterSummoners { riot_id: String },
+    Create(CreateCommand),
     Game(GameCommand),
-    Add {
-        game_id: GameId,
-        user: DiscordUserId,
-    },
-    Randomize {
-        game_id: GameId,
-    },
-    Result {
-        game_id: GameId,
-        winner: TeamSide,
-    },
+    Add(AddCommand),
+    Randomize { game_id: GameId },
+    Winner(WinnerCommand),
+    Result { game_id: GameId, winner: TeamSide },
     Results(ResultsCommand),
     Finish(FinishCommand),
     Hydrate(HydrateCommand),
-    End {
-        game_id: GameId,
-    },
-    Status {
-        game_id: Option<GameId>,
-    },
-    Stats {
-        user: Option<DiscordUserId>,
-        mode: Option<GameModeKind>,
-    },
-    Leaderboards {
-        mode: Option<GameModeKind>,
-    },
-    Analysis {
-        mode: Option<GameModeKind>,
-    },
+    LinkMatch(LinkMatchCommand),
+    End { game_id: GameId },
+    Status { game_id: Option<GameId> },
+    Stats(StatsCommand),
+    Leaderboards { mode: Option<GameModeKind> },
+    Analysis { mode: Option<GameModeKind> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateCommand {
+    pub mode: GameModeKind,
+    pub users: Vec<DiscordUserId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameCommand {
     pub mode: GameModeKind,
     pub users: Vec<DiscordUserId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddCommand {
+    pub game_id: Option<GameId>,
+    pub users: Vec<DiscordUserId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WinnerCommand {
+    pub game_id: GameId,
+    pub winner: TeamSide,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,19 @@ pub struct HydrateCommand {
     pub riot_match_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkMatchCommand {
+    pub game_id: Option<GameId>,
+    pub riot_match_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsCommand {
+    pub user: Option<DiscordUserId>,
+    pub name: Option<String>,
+    pub mode: Option<GameModeKind>,
+}
+
 #[derive(Debug, Error)]
 pub enum CommandError {
     #[error("missing command data")]
@@ -84,8 +97,12 @@ pub enum CommandError {
     ExpectedUser(&'static str),
     #[error("invalid option `{name}`: {reason}")]
     InvalidOption { name: &'static str, reason: String },
+    #[error("`/create` needs an even roster between 2 and 10 users")]
+    InvalidCreateRoster,
     #[error("`/game` needs between 2 and 10 users")]
     InvalidGameRoster,
+    #[error("`/add` needs between 1 and 10 users")]
+    InvalidAddRoster,
 }
 
 pub fn parse_command(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
@@ -93,14 +110,16 @@ pub fn parse_command(data: &ApplicationCommandData) -> Result<DiscordCommand, Co
         "register-summoners" => Ok(DiscordCommand::RegisterSummoners {
             riot_id: string_option(&data.options, "riot_id")?.to_owned(),
         }),
+        "create" => parse_create(data),
         "game" => parse_game(data),
-        "add" => Ok(DiscordCommand::Add {
-            game_id: GameId::new(string_option(&data.options, "game_id")?),
-            user: user_option(&data.options, "user")?,
-        }),
+        "add" => parse_add(data),
         "randomize" => Ok(DiscordCommand::Randomize {
             game_id: GameId::new(string_option(&data.options, "game_id")?),
         }),
+        "winner" => Ok(DiscordCommand::Winner(WinnerCommand {
+            game_id: GameId::new(string_option(&data.options, "game_id")?),
+            winner: team_option(&data.options, "winner")?,
+        })),
         "result" => Ok(DiscordCommand::Result {
             game_id: GameId::new(string_option(&data.options, "game_id")?),
             winner: team_option(&data.options, "winner")?,
@@ -108,16 +127,14 @@ pub fn parse_command(data: &ApplicationCommandData) -> Result<DiscordCommand, Co
         "results" => parse_results(data),
         "finish" => parse_finish(data),
         "hydrate" => parse_hydrate(data),
+        "link-match" => parse_link_match(data),
         "end" => Ok(DiscordCommand::End {
             game_id: GameId::new(string_option(&data.options, "game_id")?),
         }),
         "status" => Ok(DiscordCommand::Status {
             game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
         }),
-        "stats" => Ok(DiscordCommand::Stats {
-            user: optional_user_option(&data.options, "user")?,
-            mode: optional_mode_option(&data.options, "mode")?,
-        }),
+        "stats" => parse_stats(data),
         "leaderboards" => Ok(DiscordCommand::Leaderboards {
             mode: optional_mode_option(&data.options, "mode")?,
         }),
@@ -128,18 +145,57 @@ pub fn parse_command(data: &ApplicationCommandData) -> Result<DiscordCommand, Co
     }
 }
 
+fn parse_create(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
+    let mode = optional_mode_option(&data.options, "mode")?.unwrap_or(GameModeKind::AramMayhem);
+    let users = positional_users(data)?;
+    if !(2..=10).contains(&users.len()) || users.len() % 2 != 0 {
+        return Err(CommandError::InvalidCreateRoster);
+    }
+    Ok(DiscordCommand::Create(CreateCommand { mode, users }))
+}
+
 fn parse_game(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
     let mode = mode_option(&data.options, "mode")?;
-    let users = data
-        .options
-        .iter()
-        .filter(|option| option.name.starts_with("user_"))
-        .map(|option| value_as_user(option, "user_n"))
-        .collect::<Result<Vec<_>, _>>()?;
+    let users = positional_users(data)?;
     if !(2..=10).contains(&users.len()) {
         return Err(CommandError::InvalidGameRoster);
     }
     Ok(DiscordCommand::Game(GameCommand { mode, users }))
+}
+
+fn parse_add(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
+    let mut users = positional_users(data)?;
+    if users.is_empty() {
+        if let Some(user) = optional_user_option(&data.options, "user")? {
+            users.push(user);
+        }
+    }
+    if !(1..=10).contains(&users.len()) {
+        return Err(CommandError::InvalidAddRoster);
+    }
+    Ok(DiscordCommand::Add(AddCommand {
+        game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
+        users,
+    }))
+}
+
+fn parse_stats(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
+    let user = optional_user_option(&data.options, "user")?;
+    let name = optional_string_option(&data.options, "name")?
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    if user.is_some() && name.is_some() {
+        return Err(CommandError::InvalidOption {
+            name: "name",
+            reason: "use either `name` or `user`, not both".to_owned(),
+        });
+    }
+    Ok(DiscordCommand::Stats(StatsCommand {
+        user,
+        name,
+        mode: optional_mode_option(&data.options, "mode")?,
+    }))
 }
 
 fn parse_finish(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
@@ -165,6 +221,21 @@ fn parse_hydrate(data: &ApplicationCommandData) -> Result<DiscordCommand, Comman
         game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
         riot_match_id: optional_normalize_match_id_option(&data.options, "riot_match_id")?,
     }))
+}
+
+fn parse_link_match(data: &ApplicationCommandData) -> Result<DiscordCommand, CommandError> {
+    Ok(DiscordCommand::LinkMatch(LinkMatchCommand {
+        game_id: optional_string_option(&data.options, "game_id")?.map(GameId::new),
+        riot_match_id: normalize_match_id_option(&data.options, "riot_match_id")?,
+    }))
+}
+
+fn positional_users(data: &ApplicationCommandData) -> Result<Vec<DiscordUserId>, CommandError> {
+    data.options
+        .iter()
+        .filter(|option| option.name.starts_with("user_"))
+        .map(|option| value_as_user(option, "user_n"))
+        .collect()
 }
 
 fn normalize_match_id_option(
@@ -226,14 +297,6 @@ fn optional_string_option<'a>(
         .find(|option| option.name == name)
         .map(|option| value_as_str(option, name))
         .transpose()
-}
-
-fn user_option(
-    options: &[CommandOption],
-    name: &'static str,
-) -> Result<DiscordUserId, CommandError> {
-    let option = find_option(options, name)?;
-    value_as_user(option, name)
 }
 
 fn optional_user_option(
@@ -362,6 +425,68 @@ mod tests {
     }
 
     #[test]
+    fn parses_create_users() {
+        let data = ApplicationCommandData {
+            name: "create".to_owned(),
+            options: vec![
+                CommandOption {
+                    name: "user_1".to_owned(),
+                    value: Some(json!("1")),
+                    options: vec![],
+                },
+                CommandOption {
+                    name: "user_2".to_owned(),
+                    value: Some(json!("2")),
+                    options: vec![],
+                },
+                CommandOption {
+                    name: "user_3".to_owned(),
+                    value: Some(json!("3")),
+                    options: vec![],
+                },
+                CommandOption {
+                    name: "user_4".to_owned(),
+                    value: Some(json!("4")),
+                    options: vec![],
+                },
+            ],
+            resolved: None,
+        };
+        let parsed = parse_command(&data).expect("valid create command");
+        let DiscordCommand::Create(command) = parsed else {
+            panic!("expected create");
+        };
+        assert_eq!(command.mode, GameModeKind::AramMayhem);
+        assert_eq!(command.users.len(), 4);
+    }
+
+    #[test]
+    fn parses_winner() {
+        let data = ApplicationCommandData {
+            name: "winner".to_owned(),
+            options: vec![
+                CommandOption {
+                    name: "game_id".to_owned(),
+                    value: Some(json!("1283")),
+                    options: vec![],
+                },
+                CommandOption {
+                    name: "winner".to_owned(),
+                    value: Some(json!("red")),
+                    options: vec![],
+                },
+            ],
+            resolved: None,
+        };
+        let parsed = parse_command(&data).expect("valid winner command");
+        let DiscordCommand::Winner(command) = parsed else {
+            panic!("expected winner");
+        };
+        assert_eq!(command.game_id.as_str(), "1283");
+        assert_eq!(command.winner, TeamSide::Red);
+    }
+
+    #[test]
     fn parses_finish_optional_winner() {
         let data = ApplicationCommandData {
             name: "finish".to_owned(),
@@ -384,6 +509,51 @@ mod tests {
             panic!("expected finish");
         };
         assert_eq!(command.winner, Some(TeamSide::Blue));
+    }
+
+    #[test]
+    fn parses_multi_add_without_game_id() {
+        let data = ApplicationCommandData {
+            name: "add".to_owned(),
+            options: vec![
+                CommandOption {
+                    name: "user_1".to_owned(),
+                    value: Some(json!("1")),
+                    options: vec![],
+                },
+                CommandOption {
+                    name: "user_2".to_owned(),
+                    value: Some(json!("2")),
+                    options: vec![],
+                },
+            ],
+            resolved: None,
+        };
+        let parsed = parse_command(&data).expect("valid add command");
+        let DiscordCommand::Add(command) = parsed else {
+            panic!("expected add");
+        };
+        assert_eq!(command.game_id, None);
+        assert_eq!(command.users.len(), 2);
+    }
+
+    #[test]
+    fn parses_stats_name() {
+        let data = ApplicationCommandData {
+            name: "stats".to_owned(),
+            options: vec![CommandOption {
+                name: "name".to_owned(),
+                value: Some(json!("Cyracen")),
+                options: vec![],
+            }],
+            resolved: None,
+        };
+        let parsed = parse_command(&data).expect("valid stats command");
+        let DiscordCommand::Stats(command) = parsed else {
+            panic!("expected stats");
+        };
+        assert_eq!(command.name, Some("Cyracen".to_owned()));
+        assert_eq!(command.user, None);
     }
 
     #[test]
@@ -457,5 +627,34 @@ mod tests {
             panic!("expected hydrate");
         };
         assert_eq!(command.riot_match_id, Some("NA1_5561726994".to_owned()));
+    }
+
+    #[test]
+    fn parses_link_match_numeric_match_id() {
+        let data = ApplicationCommandData {
+            name: "link-match".to_owned(),
+            options: vec![
+                CommandOption {
+                    name: "riot_match_id".to_owned(),
+                    value: Some(json!("5561727000")),
+                    options: vec![],
+                },
+                CommandOption {
+                    name: "game_id".to_owned(),
+                    value: Some(json!("g_session")),
+                    options: vec![],
+                },
+            ],
+            resolved: None,
+        };
+        let parsed = parse_command(&data).expect("valid link-match command");
+        let DiscordCommand::LinkMatch(command) = parsed else {
+            panic!("expected link-match");
+        };
+        assert_eq!(
+            command.game_id.map(|id| id.into_inner()),
+            Some("g_session".to_owned())
+        );
+        assert_eq!(command.riot_match_id, "NA1_5561727000");
     }
 }

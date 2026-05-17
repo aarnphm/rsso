@@ -1,13 +1,16 @@
 use async_trait::async_trait;
-use rsso_discord::{DiscordCommand, FinishCommand, GameCommand, HydrateCommand, ResultsCommand};
+use rsso_discord::{
+    AddCommand, CreateCommand, DiscordCommand, FinishCommand, GameCommand, HydrateCommand,
+    LinkMatchCommand, ResultsCommand, StatsCommand, WinnerCommand,
+};
 use rsso_domain::{
     split_even_teams, DiscordUserId, GameId, GameModeKind, GameStatus, QueueId, Rng,
     TeamAssignment, TeamSide,
 };
 use rsso_riot::parse_riot_id;
 use rsso_storage::{
-    GameRow, MatchRecord, NewGame, NewPlayer, ParticipantRecord, RosterPlayer, Storage,
-    StorageError,
+    GameRow, MatchLinkRow, MatchRecord, NewGame, NewPlayer, ParticipantRecord, PlayerStatsRow,
+    RosterPlayer, Storage, StorageError, TeammateStatsRow,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -125,11 +128,13 @@ pub async fn handle_command_with_resolver<
         DiscordCommand::RegisterSummoners { riot_id } => {
             handle_register(storage, resolver, context, &riot_id).await
         }
+        DiscordCommand::Create(command) => handle_create(storage, context, command, rng).await,
         DiscordCommand::Game(command) => handle_game(storage, context, command, rng).await,
-        DiscordCommand::Add { game_id, user } => handle_add(storage, context, game_id, user).await,
+        DiscordCommand::Add(command) => handle_add(storage, context, command, rng).await,
         DiscordCommand::Randomize { game_id } => {
             handle_randomize(storage, context, game_id, rng).await
         }
+        DiscordCommand::Winner(command) => handle_winner(storage, context, command).await,
         DiscordCommand::Result { game_id, winner } => {
             handle_result(storage, context, game_id, winner).await
         }
@@ -140,30 +145,12 @@ pub async fn handle_command_with_resolver<
         DiscordCommand::Hydrate(command) => {
             handle_hydrate(storage, resolver, context, command).await
         }
+        DiscordCommand::LinkMatch(command) => {
+            handle_link_match(storage, resolver, context, command).await
+        }
         DiscordCommand::End { game_id } => handle_end(storage, context, game_id).await,
         DiscordCommand::Status { game_id } => handle_status(storage, context, game_id).await,
-        DiscordCommand::Stats { user, mode } => {
-            let user = user.unwrap_or_else(|| DiscordUserId::new(context.actor_id.clone()));
-            let stats = storage
-                .stats_for_player(&context.guild_id, user.as_str(), mode)
-                .await?;
-            Ok(match stats {
-                Some(stats) => format_stats_line(
-                    &format!("{}#{}", stats.riot_game_name, stats.riot_tag_line),
-                    stats.rating,
-                    stats.wins,
-                    stats.losses,
-                    stats.win_rate,
-                    StatsAverages {
-                        kills: stats.avg_kills,
-                        deaths: stats.avg_deaths,
-                        assists: stats.avg_assists,
-                        damage: stats.avg_total_damage,
-                    },
-                ),
-                None => "No stats found for that player yet.".to_owned(),
-            })
-        }
+        DiscordCommand::Stats(command) => handle_stats(storage, context, command).await,
         DiscordCommand::Leaderboards { mode } => {
             let rows = storage.leaderboard(&context.guild_id, mode, 10).await?;
             if rows.is_empty() {
@@ -239,6 +226,73 @@ async fn handle_register<S: Storage + ?Sized>(
     ))
 }
 
+async fn handle_create<S: Storage + ?Sized>(
+    storage: &S,
+    context: CommandContext,
+    command: CreateCommand,
+    rng: &mut impl Rng,
+) -> Result<String, HandlerError> {
+    ensure_unique_users(&command.users)?;
+    storage
+        .get_player(&context.guild_id, &context.actor_id)
+        .await
+        .map_err(|error| match error {
+            StorageError::NotFound => HandlerError::UserFacing(
+                "Use `/register-summoners` before creating games.".to_owned(),
+            ),
+            other => HandlerError::Storage(other),
+        })?;
+    for user in &command.users {
+        storage
+            .get_player(&context.guild_id, user.as_str())
+            .await
+            .map_err(|error| match error {
+                StorageError::NotFound => HandlerError::UserFacing(format!(
+                    "<@{}> needs `/register-summoners` before joining.",
+                    user.as_str()
+                )),
+                other => HandlerError::Storage(other),
+            })?;
+    }
+
+    let assignments = split_even_teams(&command.users, rng)
+        .map_err(|err| HandlerError::UserFacing(format!("Cannot randomize: {err}")))?;
+    let game_id = next_local_game_id(storage, rng).await?;
+    let user_ids = command
+        .users
+        .iter()
+        .map(|user| user.as_str().to_owned())
+        .collect::<Vec<_>>();
+    storage
+        .create_game(
+            NewGame {
+                game_id: game_id.as_str().to_owned(),
+                guild_id: context.guild_id,
+                channel_id: context.channel_id,
+                creator_discord_id: context.actor_id,
+                mode: command.mode,
+                now: context.now,
+            },
+            &user_ids,
+        )
+        .await
+        .map_err(|error| match error {
+            StorageError::ActiveGameExists => HandlerError::UserFacing(
+                "An open game already exists. Use `/status`, then close it with `/winner` or `/finish` before creating another.".to_owned(),
+            ),
+            other => HandlerError::Storage(other),
+        })?;
+    storage
+        .assign_teams(&game_id, &assignments, context.now)
+        .await?;
+    Ok(format!(
+        "Created with gameId {} ({})\n{}",
+        game_id,
+        command.mode.as_str(),
+        format_assignments(&assignments)
+    ))
+}
+
 async fn handle_game<S: Storage + ?Sized>(
     storage: &S,
     context: CommandContext,
@@ -300,15 +354,16 @@ async fn handle_game<S: Storage + ?Sized>(
 async fn handle_add<S: Storage + ?Sized>(
     storage: &S,
     context: CommandContext,
-    game_id: GameId,
-    user: DiscordUserId,
+    command: AddCommand,
+    rng: &mut impl Rng,
 ) -> Result<String, HandlerError> {
-    let game = storage.game_by_id(&game_id).await?;
-    if game.guild_id != context.guild_id {
-        return Err(HandlerError::UserFacing(
-            "That game belongs to a different guild.".to_owned(),
-        ));
-    }
+    let (game_id, game) = load_game_for_guild(
+        storage,
+        &context.guild_id,
+        command.game_id.clone(),
+        "No open game to add players to.",
+    )
+    .await?;
     let status = game
         .status()
         .map_err(|err| HandlerError::UserFacing(format!("Invalid stored status: {err}")))?;
@@ -317,10 +372,103 @@ async fn handle_add<S: Storage + ?Sized>(
             "Cannot add players after the lobby is locked.".to_owned(),
         ));
     }
+
+    ensure_unique_users(&command.users)?;
+
+    let roster = storage.roster(&game_id).await?;
+    let roster_ids = roster
+        .iter()
+        .map(|player| player.discord_user_id.as_str())
+        .collect::<HashSet<_>>();
+    for user in &command.users {
+        if roster_ids.contains(user.as_str()) {
+            return Err(HandlerError::UserFacing(format!(
+                "<@{}> is already in {}.",
+                user.as_str(),
+                game_id
+            )));
+        }
+        storage
+            .get_player(&context.guild_id, user.as_str())
+            .await
+            .map_err(|error| match error {
+                StorageError::NotFound => HandlerError::UserFacing(format!(
+                    "<@{}> needs `/register-summoners` before joining {}.",
+                    user.as_str(),
+                    game_id
+                )),
+                other => HandlerError::Storage(other),
+            })?;
+    }
+
+    for user in &command.users {
+        storage
+            .add_player(&game_id, &context.guild_id, user.as_str(), context.now)
+            .await?;
+    }
+
+    let mentions = command
+        .users
+        .iter()
+        .map(|user| format!("<@{}>", user.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let updated_roster = storage.roster(&game_id).await?;
+    let player_count = updated_roster.len();
+    if player_count % 2 != 0 {
+        return Ok(format!(
+            "Added {mentions} to {game_id}. Roster has {player_count} players; add one more before teams are assigned."
+        ));
+    }
+
+    let users = updated_roster
+        .iter()
+        .map(|player| DiscordUserId::new(player.discord_user_id.clone()))
+        .collect::<Vec<_>>();
+    let assignments = split_even_teams(&users, rng)
+        .map_err(|err| HandlerError::UserFacing(format!("Cannot randomize: {err}")))?;
     storage
-        .add_player(&game_id, &context.guild_id, user.as_str(), context.now)
+        .assign_teams(&game_id, &assignments, context.now)
         .await?;
-    Ok(format!("Added <@{}> to {}.", user.as_str(), game_id))
+    let prefix = if status == GameStatus::Randomized {
+        "Teams were re-randomized."
+    } else {
+        "Teams were randomized."
+    };
+    Ok(format!(
+        "Added {mentions} to {game_id}. {prefix}\n{}",
+        format_assignments(&assignments)
+    ))
+}
+
+fn ensure_unique_users(users: &[DiscordUserId]) -> Result<(), HandlerError> {
+    let mut seen = HashSet::new();
+    for user in users {
+        if !seen.insert(user.as_str()) {
+            return Err(HandlerError::UserFacing(format!(
+                "<@{}> was provided more than once.",
+                user.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn next_local_game_id<S: Storage + ?Sized>(
+    storage: &S,
+    rng: &mut impl Rng,
+) -> Result<GameId, HandlerError> {
+    for _ in 0..20 {
+        let candidate = GameId::new((1000 + (rng.next_u32() % 9000)).to_string());
+        match storage.game_by_id(&candidate).await {
+            Ok(_) => continue,
+            Err(StorageError::NotFound) => return Ok(candidate),
+            Err(error) => return Err(HandlerError::Storage(error)),
+        }
+    }
+    Err(HandlerError::UserFacing(
+        "Could not allocate a 4-digit game id after 20 attempts.".to_owned(),
+    ))
 }
 
 async fn handle_randomize<S: Storage + ?Sized>(
@@ -373,7 +521,56 @@ fn format_assignments(assignments: &[TeamAssignment]) -> String {
         .map(|assignment| format!("<@{}>", assignment.discord_user_id.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("Blue: {blue}\nRed: {red}")
+    format!("Red team: {red}\nBlue team: {blue}")
+}
+
+async fn handle_winner<S: Storage + ?Sized>(
+    storage: &S,
+    context: CommandContext,
+    command: WinnerCommand,
+) -> Result<String, HandlerError> {
+    let game = storage.game_by_id(&command.game_id).await?;
+    ensure_game_in_guild(&game, &context.guild_id)?;
+    let status = game
+        .status()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored status: {err}")))?;
+    match status {
+        GameStatus::Lobby => Err(HandlerError::UserFacing(
+            "Randomize teams before marking a winner.".to_owned(),
+        )),
+        GameStatus::Finalized => Err(HandlerError::UserFacing(
+            "That game is already finalized.".to_owned(),
+        )),
+        GameStatus::Cancelled => Err(HandlerError::UserFacing(
+            "That game is cancelled.".to_owned(),
+        )),
+        GameStatus::Randomized
+        | GameStatus::Ingame
+        | GameStatus::Reported
+        | GameStatus::Ambiguous => {
+            storage
+                .record_vote(
+                    &command.game_id,
+                    &context.actor_id,
+                    command.winner,
+                    context.now,
+                )
+                .await?;
+            storage
+                .finalize_game(
+                    &command.game_id,
+                    command.winner,
+                    game.riot_match_id.as_deref(),
+                    context.now,
+                )
+                .await?;
+            Ok(format!(
+                "Marked game {} won by {}.",
+                command.game_id,
+                command.winner.as_str()
+            ))
+        }
+    }
 }
 
 async fn handle_result<S: Storage + ?Sized>(
@@ -571,60 +768,70 @@ async fn handle_hydrate<S: Storage + ?Sized>(
     context: CommandContext,
     command: HydrateCommand,
 ) -> Result<String, HandlerError> {
-    let (game_id, game, riot_match_id) = load_hydrate_target(storage, &context, command).await?;
-    let status = game
-        .status()
-        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored status: {err}")))?;
-    if status == GameStatus::Lobby {
-        return Err(HandlerError::UserFacing(
-            "Randomize teams before hydrating match stats.".to_owned(),
-        ));
-    }
-    if status == GameStatus::Cancelled {
-        return Err(HandlerError::UserFacing(
-            "Cannot hydrate a cancelled game.".to_owned(),
-        ));
-    }
+    let target = load_hydrate_target(storage, &context, command).await?;
+    ensure_match_linkable(&target.game)?;
 
-    let Some(match_detail) = resolver.resolve_match(&riot_match_id).await? else {
+    if target.riot_match_ids.is_empty() {
         return Ok(format!(
-            "{} is linked to {}, but Riot still does not return Match-V5 data for it.",
-            game_id, riot_match_id
+            "{} has no linked matches missing Riot stats.",
+            target.game_id
         ));
-    };
-
-    let mode = game
-        .mode()
-        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored mode: {err}")))?;
-    validate_match_mode(mode, &match_detail)?;
-    let stored_winner: Option<TeamSide> = game
-        .winning_side
-        .as_deref()
-        .map(str::parse)
-        .transpose()
-        .map_err(|err| HandlerError::UserFacing(format!("{err}")))?;
-    let derived_winner = derive_winner(&match_detail);
-    if let (Some(stored), Some(derived)) = (stored_winner, derived_winner) {
-        if stored != derived {
-            return Err(HandlerError::UserFacing(format!(
-                "Riot winner {} conflicts with stored winner {} for {}.",
-                derived.as_str(),
-                stored.as_str(),
-                game_id
-            )));
-        }
     }
 
-    let roster = storage.roster(&game_id).await?;
-    let match_record = build_match_record(&game, &roster, match_detail)?;
-    let participant_count = match_record.participants.len();
-    storage
-        .record_match(&game_id, match_record, context.now)
+    let roster = storage.roster(&target.game_id).await?;
+    let mut outcomes = Vec::new();
+    for riot_match_id in &target.riot_match_ids {
+        outcomes.push(
+            sync_riot_match(
+                storage,
+                resolver,
+                MatchSyncRequest {
+                    game_id: &target.game_id,
+                    game: &target.game,
+                    roster: &roster,
+                    riot_match_id,
+                    link_when_unavailable: target.link_when_unavailable,
+                    now: context.now,
+                },
+            )
+            .await?,
+        );
+    }
+
+    Ok(format_match_sync_outcomes(&target.game_id, &outcomes))
+}
+
+async fn handle_link_match<S: Storage + ?Sized>(
+    storage: &S,
+    resolver: &(impl RiotMatchResolver + ?Sized),
+    context: CommandContext,
+    command: LinkMatchCommand,
+) -> Result<String, HandlerError> {
+    let (game_id, game) = load_game_for_guild(
+        storage,
+        &context.guild_id,
+        command.game_id.clone(),
+        "No open game to link. Pass `game_id` to link a closed session.",
+    )
+    .await?;
+    ensure_match_linkable(&game)?;
+    ensure_match_not_linked_elsewhere(storage, &context.guild_id, &game_id, &command.riot_match_id)
         .await?;
-    Ok(format!(
-        "{} hydrated from {} with {} participant row(s).",
-        game_id, riot_match_id, participant_count
-    ))
+    let roster = storage.roster(&game_id).await?;
+    let outcome = sync_riot_match(
+        storage,
+        resolver,
+        MatchSyncRequest {
+            game_id: &game_id,
+            game: &game,
+            roster: &roster,
+            riot_match_id: &command.riot_match_id,
+            link_when_unavailable: true,
+            now: context.now,
+        },
+    )
+    .await?;
+    Ok(format_match_sync_outcomes(&game_id, &[outcome]))
 }
 
 async fn handle_end<S: Storage + ?Sized>(
@@ -655,24 +862,42 @@ async fn handle_end<S: Storage + ?Sized>(
     Ok(format!("{} finalized as {} win.", game_id, winner.as_str()))
 }
 
+#[derive(Debug)]
+struct HydrateTarget {
+    game_id: GameId,
+    game: GameRow,
+    riot_match_ids: Vec<String>,
+    link_when_unavailable: bool,
+}
+
 async fn load_hydrate_target<S: Storage + ?Sized>(
     storage: &S,
     context: &CommandContext,
     command: HydrateCommand,
-) -> Result<(GameId, GameRow, String), HandlerError> {
+) -> Result<HydrateTarget, HandlerError> {
     match (command.game_id, command.riot_match_id) {
         (Some(game_id), Some(riot_match_id)) => {
             let game = storage.game_by_id(&game_id).await?;
             ensure_game_in_guild(&game, &context.guild_id)?;
-            Ok((game_id, game, riot_match_id))
+            ensure_match_not_linked_elsewhere(storage, &context.guild_id, &game_id, &riot_match_id)
+                .await?;
+            Ok(HydrateTarget {
+                game_id,
+                game,
+                riot_match_ids: vec![riot_match_id],
+                link_when_unavailable: true,
+            })
         }
         (Some(game_id), None) => {
             let game = storage.game_by_id(&game_id).await?;
             ensure_game_in_guild(&game, &context.guild_id)?;
-            let riot_match_id = game.riot_match_id.clone().ok_or_else(|| {
-                HandlerError::UserFacing(format!("{game_id} has no Riot match id yet."))
-            })?;
-            Ok((game_id, game, riot_match_id))
+            let riot_match_ids = missing_match_ids(storage, &game_id, &game).await?;
+            Ok(HydrateTarget {
+                game_id,
+                game,
+                riot_match_ids,
+                link_when_unavailable: false,
+            })
         }
         (None, Some(riot_match_id)) => {
             let game = storage
@@ -684,7 +909,12 @@ async fn load_hydrate_target<S: Storage + ?Sized>(
                     ))
                 })?;
             let game_id = GameId::new(game.game_id.clone());
-            Ok((game_id, game, riot_match_id))
+            Ok(HydrateTarget {
+                game_id,
+                game,
+                riot_match_ids: vec![riot_match_id],
+                link_when_unavailable: false,
+            })
         }
         (None, None) => {
             let game = storage
@@ -697,12 +927,278 @@ async fn load_hydrate_target<S: Storage + ?Sized>(
                     )
                 })?;
             let game_id = GameId::new(game.game_id.clone());
-            let riot_match_id = game.riot_match_id.clone().ok_or_else(|| {
-                HandlerError::UserFacing(format!("{game_id} has no Riot match id yet."))
-            })?;
-            Ok((game_id, game, riot_match_id))
+            let riot_match_ids = missing_match_ids(storage, &game_id, &game).await?;
+            Ok(HydrateTarget {
+                game_id,
+                game,
+                riot_match_ids,
+                link_when_unavailable: false,
+            })
         }
     }
+}
+
+async fn missing_match_ids<S: Storage + ?Sized>(
+    storage: &S,
+    game_id: &GameId,
+    game: &GameRow,
+) -> Result<Vec<String>, HandlerError> {
+    let links = storage.matches_for_game(game_id).await?;
+    let mut missing = links
+        .iter()
+        .filter(|link| link.needs_hydration())
+        .map(|link| link.riot_match_id.clone())
+        .collect::<Vec<_>>();
+    if let Some(riot_match_id) = game.riot_match_id.as_ref() {
+        if !links
+            .iter()
+            .any(|link| link.riot_match_id == *riot_match_id)
+        {
+            missing.push(riot_match_id.clone());
+        }
+    }
+    if links.is_empty() && missing.is_empty() {
+        return Err(HandlerError::UserFacing(format!(
+            "{game_id} has no Riot match id yet."
+        )));
+    }
+    Ok(missing)
+}
+
+fn ensure_match_linkable(game: &GameRow) -> Result<(), HandlerError> {
+    let status = game
+        .status()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored status: {err}")))?;
+    match status {
+        GameStatus::Lobby => Err(HandlerError::UserFacing(
+            "Randomize teams before linking Riot matches.".to_owned(),
+        )),
+        GameStatus::Cancelled => Err(HandlerError::UserFacing(
+            "Cannot link Riot matches to a cancelled game.".to_owned(),
+        )),
+        GameStatus::Randomized
+        | GameStatus::Ingame
+        | GameStatus::Reported
+        | GameStatus::Finalized
+        | GameStatus::Ambiguous => Ok(()),
+    }
+}
+
+async fn ensure_match_not_linked_elsewhere<S: Storage + ?Sized>(
+    storage: &S,
+    guild_id: &str,
+    game_id: &GameId,
+    riot_match_id: &str,
+) -> Result<(), HandlerError> {
+    let Some(existing) = storage
+        .game_by_riot_match_id(guild_id, riot_match_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    if existing.game_id == game_id.as_str() {
+        Ok(())
+    } else {
+        Err(HandlerError::UserFacing(format!(
+            "{riot_match_id} is already linked to {}.",
+            existing.game_id
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MatchSyncOutcome {
+    Hydrated {
+        riot_match_id: String,
+        participant_count: usize,
+    },
+    LinkedManual {
+        riot_match_id: String,
+    },
+    Unavailable {
+        riot_match_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatchSyncRequest<'a> {
+    game_id: &'a GameId,
+    game: &'a GameRow,
+    roster: &'a [RosterPlayer],
+    riot_match_id: &'a str,
+    link_when_unavailable: bool,
+    now: i64,
+}
+
+async fn sync_riot_match<S: Storage + ?Sized>(
+    storage: &S,
+    resolver: &(impl RiotMatchResolver + ?Sized),
+    request: MatchSyncRequest<'_>,
+) -> Result<MatchSyncOutcome, HandlerError> {
+    let mode = request
+        .game
+        .mode()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored mode: {err}")))?;
+    let Some(match_detail) = resolver.resolve_match(request.riot_match_id).await? else {
+        if request.link_when_unavailable {
+            storage
+                .record_match(
+                    request.game_id,
+                    manual_match_record(&request.game.guild_id, mode, request.riot_match_id),
+                    request.now,
+                )
+                .await?;
+            return Ok(MatchSyncOutcome::LinkedManual {
+                riot_match_id: request.riot_match_id.to_owned(),
+            });
+        }
+        return Ok(MatchSyncOutcome::Unavailable {
+            riot_match_id: request.riot_match_id.to_owned(),
+        });
+    };
+
+    validate_match_mode(mode, &match_detail)?;
+    let stored_winner: Option<TeamSide> = request
+        .game
+        .winning_side
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|err| HandlerError::UserFacing(format!("{err}")))?;
+    let derived_winner = derive_winner(&match_detail);
+    if let (Some(stored), Some(derived)) = (stored_winner, derived_winner) {
+        if stored != derived {
+            return Err(HandlerError::UserFacing(format!(
+                "Riot winner {} conflicts with stored winner {} for {}.",
+                derived.as_str(),
+                stored.as_str(),
+                request.game_id
+            )));
+        }
+    }
+
+    let match_record = build_match_record(request.game, request.roster, match_detail)?;
+    let riot_match_id = match_record.riot_match_id.clone();
+    let participant_count = match_record.participants.len();
+    storage
+        .record_match(request.game_id, match_record, request.now)
+        .await?;
+    Ok(MatchSyncOutcome::Hydrated {
+        riot_match_id,
+        participant_count,
+    })
+}
+
+fn format_match_sync_outcomes(game_id: &GameId, outcomes: &[MatchSyncOutcome]) -> String {
+    if let [outcome] = outcomes {
+        return match outcome {
+            MatchSyncOutcome::Hydrated {
+                riot_match_id,
+                participant_count,
+            } => format!(
+                "{game_id} hydrated from {riot_match_id} with {participant_count} participant row(s)."
+            ),
+            MatchSyncOutcome::LinkedManual { riot_match_id } => format!(
+                "{game_id} linked to {riot_match_id}. Riot still does not return Match-V5 data; run `/hydrate game_id:{game_id}` later."
+            ),
+            MatchSyncOutcome::Unavailable { riot_match_id } => format!(
+                "{game_id} is linked to {riot_match_id}, but Riot still does not return Match-V5 data for it."
+            ),
+        };
+    }
+
+    let mut hydrated_ids = Vec::new();
+    let mut participant_rows = 0_usize;
+    let mut linked_ids = Vec::new();
+    let mut unavailable_ids = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            MatchSyncOutcome::Hydrated {
+                riot_match_id,
+                participant_count,
+            } => {
+                hydrated_ids.push(riot_match_id.clone());
+                participant_rows += *participant_count;
+            }
+            MatchSyncOutcome::LinkedManual { riot_match_id } => {
+                linked_ids.push(riot_match_id.clone());
+            }
+            MatchSyncOutcome::Unavailable { riot_match_id } => {
+                unavailable_ids.push(riot_match_id.clone());
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !hydrated_ids.is_empty() {
+        parts.push(format!(
+            "hydrated {} match(es) ({}) with {participant_rows} participant row(s)",
+            hydrated_ids.len(),
+            format_limited_ids(&hydrated_ids)
+        ));
+    }
+    if !linked_ids.is_empty() {
+        parts.push(format!(
+            "linked {} match(es) still unavailable from Riot ({})",
+            linked_ids.len(),
+            format_limited_ids(&linked_ids)
+        ));
+    }
+    if !unavailable_ids.is_empty() {
+        parts.push(format!(
+            "{} linked match(es) still unavailable from Riot ({})",
+            unavailable_ids.len(),
+            format_limited_ids(&unavailable_ids)
+        ));
+    }
+    format!("{game_id}: {}.", parts.join("; "))
+}
+
+fn format_limited_ids(ids: &[String]) -> String {
+    let shown = ids
+        .iter()
+        .take(3)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ids.len() > 3 {
+        format!("{shown}, +{} more", ids.len() - 3)
+    } else {
+        shown
+    }
+}
+
+fn format_status_match_links(links: &[MatchLinkRow], fallback: Option<&str>) -> String {
+    if links.is_empty() {
+        return fallback.map_or_else(
+            || "Riot matches: pending until Spectator sees the live game".to_owned(),
+            |match_id| format!("Riot matches: 1 linked ({match_id}, missing stats)"),
+        );
+    }
+
+    let ids = links
+        .iter()
+        .take(3)
+        .map(|link| link.riot_match_id.clone())
+        .collect::<Vec<_>>();
+    let suffix = if links.len() > 3 {
+        format!(", +{} more", links.len() - 3)
+    } else {
+        String::new()
+    };
+    let missing = links.iter().filter(|link| link.needs_hydration()).count();
+    let hydrate_status = if missing > 0 {
+        format!(", {missing} missing stats")
+    } else {
+        ", stats hydrated".to_owned()
+    };
+    format!(
+        "Riot matches: {} linked ({}{}{})",
+        links.len(),
+        ids.join(", "),
+        suffix,
+        hydrate_status
+    )
 }
 
 async fn handle_status<S: Storage + ?Sized>(
@@ -712,14 +1208,46 @@ async fn handle_status<S: Storage + ?Sized>(
 ) -> Result<String, HandlerError> {
     let (game_id, game) =
         load_game_for_guild(storage, &context.guild_id, game_id, "No open game found.").await?;
-    let riot_link = game.riot_match_id.as_deref().map_or_else(
-        || "Riot match id: pending until Spectator sees the live game".to_owned(),
-        |match_id| format!("Riot match id: {match_id}"),
-    );
+    let match_links = storage.matches_for_game(&game_id).await?;
+    let riot_link = format_status_match_links(&match_links, game.riot_match_id.as_deref());
     Ok(format!(
         "{}: mode {}, status {}, {}",
         game_id, game.mode, game.status, riot_link
     ))
+}
+
+async fn handle_stats<S: Storage + ?Sized>(
+    storage: &S,
+    context: CommandContext,
+    command: StatsCommand,
+) -> Result<String, HandlerError> {
+    let discord_user_id = match (command.user, command.name.as_deref()) {
+        (Some(user), None) => user,
+        (None, Some(name)) => storage
+            .get_player_by_riot_name(&context.guild_id, name)
+            .await?
+            .map(|player| DiscordUserId::new(player.discord_user_id))
+            .ok_or_else(|| {
+                HandlerError::UserFacing(format!("No registered player found for `{name}`."))
+            })?,
+        (None, None) => DiscordUserId::new(context.actor_id.clone()),
+        (Some(_), Some(_)) => {
+            return Err(HandlerError::UserFacing(
+                "Use either `name` or `user`, not both.".to_owned(),
+            ));
+        }
+    };
+
+    let Some(stats) = storage
+        .stats_for_player(&context.guild_id, discord_user_id.as_str(), command.mode)
+        .await?
+    else {
+        return Ok("No stats found for that player yet.".to_owned());
+    };
+    let teammates = storage
+        .teammate_stats(&context.guild_id, discord_user_id.as_str(), command.mode)
+        .await?;
+    Ok(format_detailed_stats(&stats, &teammates))
 }
 
 async fn load_game_for_guild<S: Storage + ?Sized>(
@@ -906,4 +1434,142 @@ fn format_stats_line(
         line.push_str(&format!(", {:.0} avg dmg", damage));
     }
     line
+}
+
+fn format_detailed_stats(stats: &PlayerStatsRow, teammates: &[TeammateStatsRow]) -> String {
+    let games_total = stats.wins + stats.losses;
+    let win_rate = stats.win_rate * 100.0;
+    let most_won = teammates
+        .iter()
+        .filter(|row| row.wins > 0)
+        .max_by_key(|row| (row.wins, row.games));
+    let most_lost = teammates
+        .iter()
+        .filter(|row| row.losses > 0)
+        .max_by_key(|row| (row.losses, row.games));
+
+    format!(
+        "{}#{}\nW: {} L: {} Games total: {} WR: {:.1}% Rating: {}\nMost won with players: {}\nMost lost with players: {}",
+        stats.riot_game_name,
+        stats.riot_tag_line,
+        stats.wins,
+        stats.losses,
+        games_total,
+        win_rate,
+        stats.rating,
+        format_teammate_row(most_won),
+        format_teammate_row(most_lost),
+    )
+}
+
+fn format_teammate_row(row: Option<&TeammateStatsRow>) -> String {
+    row.map_or_else(
+        || "none yet".to_owned(),
+        |row| {
+            format!(
+                "{}#{} ({}W/{}L, {} games)",
+                row.riot_game_name, row.riot_tag_line, row.wins, row.losses, row.games
+            )
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        format_detailed_stats, format_match_sync_outcomes, format_status_match_links,
+        MatchSyncOutcome,
+    };
+    use rsso_domain::GameId;
+    use rsso_storage::{MatchLinkRow, PlayerStatsRow, TeammateStatsRow};
+
+    #[test]
+    fn formats_batch_hydrate_outcomes() {
+        let game_id = GameId::new("g_session");
+        let message = format_match_sync_outcomes(
+            &game_id,
+            &[
+                MatchSyncOutcome::Hydrated {
+                    riot_match_id: "NA1_1".to_owned(),
+                    participant_count: 10,
+                },
+                MatchSyncOutcome::Unavailable {
+                    riot_match_id: "NA1_2".to_owned(),
+                },
+            ],
+        );
+        assert!(message.contains("hydrated 1 match(es)"));
+        assert!(message.contains("1 linked match(es) still unavailable"));
+    }
+
+    #[test]
+    fn status_reports_multiple_matches_and_missing_stats() {
+        let message = format_status_match_links(
+            &[
+                MatchLinkRow {
+                    riot_match_id: "NA1_2".to_owned(),
+                    data_source: "manual".to_owned(),
+                    queue_id: None,
+                    map_id: None,
+                    riot_game_mode: None,
+                    riot_game_type: None,
+                    finalized_at: 20,
+                    participant_count: 0,
+                },
+                MatchLinkRow {
+                    riot_match_id: "NA1_1".to_owned(),
+                    data_source: "match_v5".to_owned(),
+                    queue_id: Some(450),
+                    map_id: Some(12),
+                    riot_game_mode: Some("ARAM".to_owned()),
+                    riot_game_type: Some("CUSTOM_GAME".to_owned()),
+                    finalized_at: 10,
+                    participant_count: 10,
+                },
+            ],
+            None,
+        );
+        assert!(message.contains("2 linked"));
+        assert!(message.contains("1 missing stats"));
+    }
+
+    #[test]
+    fn formats_simple_stats_with_teammates() {
+        let stats = PlayerStatsRow {
+            guild_id: "g".to_owned(),
+            discord_user_id: "1".to_owned(),
+            riot_game_name: "Cyracen".to_owned(),
+            riot_tag_line: "NA1".to_owned(),
+            rating: 1520,
+            wins: 12,
+            losses: 8,
+            win_rate: 0.6,
+            avg_kills: None,
+            avg_deaths: None,
+            avg_assists: None,
+            avg_total_damage: None,
+        };
+        let teammates = vec![
+            TeammateStatsRow {
+                discord_user_id: "2".to_owned(),
+                riot_game_name: "Vu".to_owned(),
+                riot_tag_line: "NA1".to_owned(),
+                games: 5,
+                wins: 4,
+                losses: 1,
+            },
+            TeammateStatsRow {
+                discord_user_id: "3".to_owned(),
+                riot_game_name: "Chongly".to_owned(),
+                riot_tag_line: "NA1".to_owned(),
+                games: 6,
+                wins: 1,
+                losses: 5,
+            },
+        ];
+        let message = format_detailed_stats(&stats, &teammates);
+        assert!(message.contains("W: 12 L: 8 Games total: 20 WR: 60.0%"));
+        assert!(message.contains("Most won with players: Vu#NA1"));
+        assert!(message.contains("Most lost with players: Chongly#NA1"));
+    }
 }

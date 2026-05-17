@@ -4,5 +4,6 @@ node_modules
 build
 .env
 .dev.vars
+riot.txt
 !migrations/
 !migrations/*.sql

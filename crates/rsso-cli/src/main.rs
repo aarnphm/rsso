@@ -127,21 +127,9 @@ fn command_manifest() -> serde_json::Value {
             ]
         },
         {
-            "name": "game",
-            "description": "Create a new in-house game",
+            "name": "create",
+            "description": "Create and randomize a local in-house game",
             "options": [
-                {
-                    "name": "mode",
-                    "description": "Game mode",
-                    "type": 3,
-                    "required": true,
-                    "choices": [
-                        {"name": "Rift", "value": "rift"},
-                        {"name": "ARAM", "value": "aram"},
-                        {"name": "ARAM: Mayhem", "value": "aram_mayhem"},
-                        {"name": "Other", "value": "other"}
-                    ]
-                },
                 {"name": "user_1", "description": "Player 1", "type": 6, "required": true},
                 {"name": "user_2", "description": "Player 2", "type": 6, "required": true},
                 {"name": "user_3", "description": "Player 3", "type": 6, "required": false},
@@ -151,27 +139,30 @@ fn command_manifest() -> serde_json::Value {
                 {"name": "user_7", "description": "Player 7", "type": 6, "required": false},
                 {"name": "user_8", "description": "Player 8", "type": 6, "required": false},
                 {"name": "user_9", "description": "Player 9", "type": 6, "required": false},
-                {"name": "user_10", "description": "Player 10", "type": 6, "required": false}
+                {"name": "user_10", "description": "Player 10", "type": 6, "required": false},
+                {"name": "mode", "description": "Mode, defaults to ARAM: Mayhem", "type": 3, "required": false, "choices": mode_choices()}
             ]
         },
         {
             "name": "add",
-            "description": "Add a player to a game",
+            "description": "Add players to the current game",
             "options": [
-                {"name": "game_id", "description": "Local game id", "type": 3, "required": true},
-                {"name": "user", "description": "Discord user", "type": 6, "required": true}
+                {"name": "user_1", "description": "Player 1", "type": 6, "required": true},
+                {"name": "user_2", "description": "Player 2", "type": 6, "required": false},
+                {"name": "user_3", "description": "Player 3", "type": 6, "required": false},
+                {"name": "user_4", "description": "Player 4", "type": 6, "required": false},
+                {"name": "user_5", "description": "Player 5", "type": 6, "required": false},
+                {"name": "user_6", "description": "Player 6", "type": 6, "required": false},
+                {"name": "user_7", "description": "Player 7", "type": 6, "required": false},
+                {"name": "user_8", "description": "Player 8", "type": 6, "required": false},
+                {"name": "user_9", "description": "Player 9", "type": 6, "required": false},
+                {"name": "user_10", "description": "Player 10", "type": 6, "required": false},
+                {"name": "game_id", "description": "Local game id; defaults to the open game", "type": 3, "required": false}
             ]
         },
         {
-            "name": "randomize",
-            "description": "Randomize teams for a game",
-            "options": [
-                {"name": "game_id", "description": "Local game id", "type": 3, "required": true}
-            ]
-        },
-        {
-            "name": "result",
-            "description": "Report the winning side",
+            "name": "winner",
+            "description": "Finalize a local game by winning side",
             "options": [
                 {"name": "game_id", "description": "Local game id", "type": 3, "required": true},
                 {
@@ -187,85 +178,11 @@ fn command_manifest() -> serde_json::Value {
             ]
         },
         {
-            "name": "results",
-            "description": "Report a result and optionally link Riot match data",
-            "options": [
-                {"name": "game_id", "description": "Local game id", "type": 3, "required": false},
-                {
-                    "name": "winner",
-                    "description": "Winning side",
-                    "type": 3,
-                    "required": false,
-                    "choices": [
-                        {"name": "Blue", "value": "blue"},
-                        {"name": "Red", "value": "red"}
-                    ]
-                },
-                {"name": "riot_match_id", "description": "Riot match id or numeric Riot game id", "type": 3, "required": false},
-                {"name": "region", "description": "Region for numeric Riot game id", "type": 3, "required": false, "choices": region_choices()}
-            ]
-        },
-        {
-            "name": "finish",
-            "description": "Finalize a game from a Riot match id",
-            "options": [
-                {"name": "riot_match_id", "description": "Riot match id or numeric Riot game id", "type": 3, "required": true},
-                {"name": "game_id", "description": "Local game id", "type": 3, "required": false},
-                {
-                    "name": "winner",
-                    "description": "Winning side",
-                    "type": 3,
-                    "required": false,
-                    "choices": [
-                        {"name": "Blue", "value": "blue"},
-                        {"name": "Red", "value": "red"}
-                    ]
-                },
-                {"name": "region", "description": "Region for numeric Riot game id", "type": 3, "required": false, "choices": region_choices()}
-            ]
-        },
-        {
-            "name": "hydrate",
-            "description": "Backfill Riot participant stats for a linked game",
-            "options": [
-                {"name": "game_id", "description": "Local game id", "type": 3, "required": false},
-                {"name": "riot_match_id", "description": "Riot match id or numeric Riot game id", "type": 3, "required": false},
-                {"name": "region", "description": "Region for numeric Riot game id", "type": 3, "required": false, "choices": region_choices()}
-            ]
-        },
-        {
-            "name": "end",
-            "description": "Finalize a reported game",
-            "options": [
-                {"name": "game_id", "description": "Local game id", "type": 3, "required": true}
-            ]
-        },
-        {
-            "name": "status",
-            "description": "Show the local to Riot match link for a game",
-            "options": [
-                {"name": "game_id", "description": "Local game id", "type": 3, "required": false}
-            ]
-        },
-        {
             "name": "stats",
             "description": "Show in-house stats",
             "options": [
+                {"name": "name", "description": "Registered Riot game name or Riot ID", "type": 3, "required": false},
                 {"name": "user", "description": "Discord user", "type": 6, "required": false},
-                {"name": "mode", "description": "Mode filter", "type": 3, "required": false, "choices": mode_choices()}
-            ]
-        },
-        {
-            "name": "leaderboards",
-            "description": "Show in-house leaderboard",
-            "options": [
-                {"name": "mode", "description": "Mode filter", "type": 3, "required": false, "choices": mode_choices()}
-            ]
-        },
-        {
-            "name": "analysis",
-            "description": "Show analysis stub",
-            "options": [
                 {"name": "mode", "description": "Mode filter", "type": 3, "required": false, "choices": mode_choices()}
             ]
         }
@@ -278,26 +195,5 @@ fn mode_choices() -> serde_json::Value {
         {"name": "ARAM", "value": "aram"},
         {"name": "ARAM: Mayhem", "value": "aram_mayhem"},
         {"name": "Other", "value": "other"}
-    ])
-}
-
-fn region_choices() -> serde_json::Value {
-    serde_json::json!([
-        {"name": "NA", "value": "NA"},
-        {"name": "BR", "value": "BR"},
-        {"name": "LAN", "value": "LAN"},
-        {"name": "LAS", "value": "LAS"},
-        {"name": "EUW", "value": "EUW"},
-        {"name": "EUNE", "value": "EUNE"},
-        {"name": "KR", "value": "KR"},
-        {"name": "JP", "value": "JP"},
-        {"name": "OCE", "value": "OCE"},
-        {"name": "TR", "value": "TR"},
-        {"name": "RU", "value": "RU"},
-        {"name": "PH", "value": "PH"},
-        {"name": "SG", "value": "SG"},
-        {"name": "TH", "value": "TH"},
-        {"name": "TW", "value": "TW"},
-        {"name": "VN", "value": "VN"}
     ])
 }

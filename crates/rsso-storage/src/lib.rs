@@ -5,7 +5,7 @@ pub mod repository;
 pub mod d1;
 
 pub use models::{
-    GameRow, LeaderboardRow, LiveGameUpdate, MatchRecord, NewGame, NewPlayer, ParticipantRecord,
-    PlayerRow, PlayerStatsRow, RosterPlayer,
+    GameRow, LeaderboardRow, LiveGameUpdate, MatchLinkRow, MatchRecord, NewGame, NewPlayer,
+    ParticipantRecord, PlayerRow, PlayerStatsRow, RosterPlayer, TeammateStatsRow,
 };
 pub use repository::{Storage, StorageError, StorageResult};

@@ -1,8 +1,8 @@
 # Discord Command Runbook
 
-This bot uses Discord guild slash commands backed by a Cloudflare Worker and D1. Commands are registered through `rsso-cli`, then handled by the deployed Worker at the Discord interaction endpoint.
+This bot uses Discord guild slash commands backed by a Cloudflare Worker and D1. The registered command surface is intentionally small: `/register-summoners`, `/create`, `/add`, `/winner`, and `/stats`.
 
-## Server Workflow
+## Active Workflow
 
 1. Register each player:
 
@@ -10,109 +10,73 @@ This bot uses Discord guild slash commands backed by a Cloudflare Worker and D1.
 /register-summoners riot_id:Cyracen#NA1
 ```
 
-`riot_id` must use Riot ID format, `GameName#TAG`. With `RIOT_API_KEY` configured, the bot stores the Riot PUUID. If the key is absent or Riot returns 404, the claim is stored without a PUUID so the in-house can still run.
+`riot_id` must use Riot ID format, `GameName#TAG`. With `RIOT_API_KEY` configured, the bot stores the Riot PUUID. If Riot lookup is unavailable, the command still stores a trusted claim so the local in-house flow can run.
 
-2. Create a game:
-
-```text
-/game mode:ARAM user_1:@a user_2:@b user_3:@c user_4:@d
-```
-
-The bot creates one local `game_id`, for example `g_abc123`, and stores the local roster. Even player counts are randomized immediately. Odd player counts stay in `lobby` until another player is added.
-
-3. Add a missing player when needed:
+2. Create and randomize one game:
 
 ```text
-/add game_id:g_abc123 user:@e
-/randomize game_id:g_abc123
+/create user_1:@vu user_2:@chongly user_3:@cyracen user_4:@tanguan
+/create user_1:@vu user_2:@chongly mode:ARAM
 ```
 
-`/add` only works before the game is locked by live-game tracking. `/randomize` can be rerun while the game is still in `lobby` or `randomized`.
-
-4. Check the local game to Riot match link:
+`/create` requires an even roster between 2 and 10 players. It creates a 4-digit local `game_id`, defaults to `ARAM: Mayhem`, and returns Discord mentions for each team:
 
 ```text
-/status
-/status game_id:g_abc123
+Created with gameId 1283 (aram_mayhem)
+Red team: @vu @cyracen
+Blue team: @tanguan @chongly
 ```
 
-`/status` without `game_id` reads the current open game for the guild. The Riot match id is pending until the 3-minute scheduled worker sees the game through Spectator-V5 or someone links an id manually.
-
-5. Report the result:
+3. Add late players if needed:
 
 ```text
-/results game_id:g_abc123 winner:Blue
-/results game_id:g_abc123 riot_match_id:NA1_4901234567
-/results game_id:g_abc123 riot_match_id:5561312307 region:NA
-/results game_id:g_abc123 winner:Blue riot_match_id:NA1_4901234567
+/add user_1:@late
+/add user_1:@late user_2:@also_late
 ```
 
-`/results` can be used after teams are randomized, while the game is `randomized`, `ingame`, `ambiguous`, or already `reported`.
+`/add` defaults to the current open game. When the resulting roster is even, it randomizes teams again. When the roster is odd, it keeps the game open and asks for one more player.
 
-When `riot_match_id` is present, the bot tries Match-V5. If Riot returns the match, the bot validates the mode, validates that registered roster PUUIDs appear in the match, stores `matches` and `match_participants`, and derives the winner when possible. If Riot does not return the match yet, the bot still links the supplied Riot match id to the local game as manual data.
-
-`riot_match_id` accepts either a full Riot match id such as `NA1_5561312307` or a numeric Riot game id such as `5561312307`. Numeric game ids default to `region:NA`, which becomes `NA1_5561312307`. Pass `region:EUW`, `region:KR`, or another supported region when the match is outside NA.
-
-Supported `region` values are `NA`, `BR`, `LAN`, `LAS`, `EUW`, `EUNE`, `KR`, `JP`, `OCE`, `TR`, `RU`, `PH`, `SG`, `TH`, `TW`, and `VN`.
-
-When `winner` and `riot_match_id` are both present, the game finalizes immediately. When `winner` is present without `riot_match_id`, the game moves to `reported`; ratings and W/L counters stay unchanged until `/end`.
-
-6. Finalize a reported game:
+4. Mark the winner:
 
 ```text
-/end game_id:g_abc123
+/winner game_id:1283 winner:Red
 ```
 
-`/end` finalizes the reported winner, closes the local game, and updates ratings plus W/L counters. For now, only the creator of the local game can run `/end`.
+`/winner` finalizes the game immediately, updates W/L counters, updates ratings, and closes the singleton open game.
 
-7. Finalize directly from Riot match id:
-
-```text
-/finish riot_match_id:NA1_4901234567
-/finish riot_match_id:5561312307 region:NA
-/finish riot_match_id:NA1_4901234567 game_id:g_abc123 winner:Blue
-```
-
-`/finish` is the direct finalization path. Use it when the Riot match id is known and the game should close immediately. If `game_id` is omitted, the bot uses the current open game for the guild. If Match-V5 cannot derive a winner or returns 403, pass `winner`; if the game was already reported, `/finish` can reuse the stored winner. If no winner is available, `/finish` still links the Riot match id and tells you to rerun it with `winner`.
-
-8. Hydrate missing Riot stats:
-
-```text
-/hydrate
-/hydrate riot_match_id:5561312307
-/hydrate game_id:g_abc123
-/hydrate game_id:g_abc123 riot_match_id:5561312307 region:NA
-```
-
-`/hydrate` retries Match-V5 and backfills `matches` plus `match_participants` for a linked local game. With no options, it targets the latest linked game in the guild. With a numeric `riot_match_id`, it defaults to `region:NA`, so `5561312307` becomes `NA1_5561312307`.
-
-Hydration does not change ratings or W/L. It only fills the missing Riot payload so champion, KDA, damage, gold, minion, and vision stats can appear in stats views. If Riot still returns 403 or 404, the bot leaves the existing manual link alone and reports that Match-V5 data is still unavailable.
-
-9. Read stats:
+5. Read stats:
 
 ```text
 /stats
-/stats user:@a
-/stats user:@a mode:ARAM
-/leaderboards
-/leaderboards mode:ARAM: Mayhem
-/analysis
+/stats name:Cyracen
+/stats name:Cyracen#NA1
+/stats user:@cyracen
+/stats user:@cyracen mode:ARAM
 ```
 
-Stats and leaderboards count finalized games. Champion and damage averages depend on Riot match data in `match_participants`.
+`/stats name:` resolves against registered Riot game names. The response includes W/L, total games, win rate, rating, and teammate rows for most wins and losses together.
 
-## Match Linking Rules
+## Deferred Commands
 
-- `/game` creates the local `game_id`.
-- The scheduled Worker runs every 3 minutes and links `game_id` to `riot_match_id` when Spectator-V5 sees a registered PUUID in an active game.
-- `/results riot_match_id:... winner:...` links a Riot match id after the fact and finalizes ratings.
-- `/finish riot_match_id:...` links the Riot match id and finalizes the game in one command.
-- `/hydrate` retries a linked Riot match id and backfills participant stats when Match-V5 becomes visible.
-- `/status` shows the current link state.
+The code still has parser and handler support for these commands, but `rsso-cli` no longer registers them in Discord:
+
+- `/game mode user_1 ... user_10`
+- `/randomize game_id`
+- `/result game_id winner`
+- `/results game_id? winner? riot_match_id? region?`
+- `/finish riot_match_id game_id? winner? region?`
+- `/hydrate game_id? riot_match_id? region?`
+- `/link-match riot_match_id game_id? region?`
+- `/end game_id`
+- `/status game_id?`
+- `/leaderboards mode?`
+- `/analysis mode?`
+
+`/result` was the old two-step manual path: report a winner, then `/end` finalized later. `/results` was the Riot-aware path: report a winner and optionally attach Match-V5 data. `/winner` replaces the local need for both by finalizing immediately. The Riot-aware paths can come back later under cleaner names once RSO-backed ingestion is worth exposing.
 
 ## Operator Commands
 
-Print the command manifest:
+Print the registered command manifest:
 
 ```sh
 cargo run -p rsso-cli -- discord commands-json
@@ -137,7 +101,10 @@ Deploy the Worker:
 
 ```sh
 npx wrangler deploy
+curl -fsS https://rsso.aarnphm.workers.dev/riot.txt >/dev/null
 ```
+
+`wrangler.toml` reads the ignored repo-root `riot.txt` during the custom Worker build and embeds it into the deployed `/riot.txt` route for Riot domain verification. Keep the file local; it should not be committed.
 
 Apply D1 migrations:
 

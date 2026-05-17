@@ -1,10 +1,11 @@
 use crate::models::{
-    GameRow, LeaderboardRow, LiveGameUpdate, MatchRecord, NewGame, NewPlayer, PlayerRow,
-    PlayerStatsRow, RosterPlayer,
+    GameRow, LeaderboardRow, LiveGameUpdate, MatchLinkRow, MatchRecord, NewGame, NewPlayer,
+    PlayerRow, PlayerStatsRow, RosterPlayer, TeammateStatsRow,
 };
 use crate::repository::{Storage, StorageError, StorageResult};
 use async_trait::async_trait;
 use rsso_domain::{GameId, GameModeKind, GameStatus, TeamAssignment, TeamSide};
+use serde::Deserialize;
 use wasm_bindgen::JsValue;
 use worker::D1Database;
 
@@ -17,11 +18,124 @@ impl D1Storage {
     pub fn new(db: D1Database) -> Self {
         Self { db }
     }
+
+    async fn ensure_player_claim_available(&self, player: &NewPlayer) -> StorageResult<()> {
+        if let Some(puuid) = player.riot_puuid.as_deref() {
+            if let Some(owner) = self
+                .player_claim_owner_by_puuid(&player.guild_id, puuid)
+                .await?
+            {
+                if owner.discord_user_id != player.discord_user_id {
+                    return Err(StorageError::RiotPuuidAlreadyRegistered {
+                        discord_user_id: owner.discord_user_id,
+                    });
+                }
+            }
+        }
+
+        if let Some(owner) = self
+            .player_claim_owner_by_riot_id(
+                &player.guild_id,
+                &player.riot_game_name,
+                &player.riot_tag_line,
+            )
+            .await?
+        {
+            if owner.discord_user_id != player.discord_user_id {
+                return Err(StorageError::RiotIdAlreadyRegistered {
+                    discord_user_id: owner.discord_user_id,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn map_player_claim_conflict(&self, player: &NewPlayer, message: String) -> StorageError {
+        if message.contains("players.guild_id, players.riot_puuid") {
+            if let Some(puuid) = player.riot_puuid.as_deref() {
+                if let Ok(Some(owner)) = self
+                    .player_claim_owner_by_puuid(&player.guild_id, puuid)
+                    .await
+                {
+                    return StorageError::RiotPuuidAlreadyRegistered {
+                        discord_user_id: owner.discord_user_id,
+                    };
+                }
+            }
+        }
+
+        if message.contains("players.guild_id, players.riot_game_name, players.riot_tag_line") {
+            if let Ok(Some(owner)) = self
+                .player_claim_owner_by_riot_id(
+                    &player.guild_id,
+                    &player.riot_game_name,
+                    &player.riot_tag_line,
+                )
+                .await
+            {
+                return StorageError::RiotIdAlreadyRegistered {
+                    discord_user_id: owner.discord_user_id,
+                };
+            }
+        }
+
+        StorageError::Backend(message)
+    }
+
+    async fn player_claim_owner_by_puuid(
+        &self,
+        guild_id: &str,
+        riot_puuid: &str,
+    ) -> StorageResult<Option<PlayerClaimOwner>> {
+        first(
+            self.db
+                .prepare(
+                    "
+                    SELECT discord_user_id
+                    FROM players
+                    WHERE guild_id = ?1 AND riot_puuid = ?2
+                    LIMIT 1
+                    ",
+                )
+                .bind(&[js(guild_id), js(riot_puuid)])?,
+        )
+        .await
+    }
+
+    async fn player_claim_owner_by_riot_id(
+        &self,
+        guild_id: &str,
+        riot_game_name: &str,
+        riot_tag_line: &str,
+    ) -> StorageResult<Option<PlayerClaimOwner>> {
+        first(
+            self.db
+                .prepare(
+                    "
+                    SELECT discord_user_id
+                    FROM players
+                    WHERE guild_id = ?1
+                      AND lower(riot_game_name) = lower(?2)
+                      AND lower(riot_tag_line) = lower(?3)
+                    LIMIT 1
+                    ",
+                )
+                .bind(&[js(guild_id), js(riot_game_name), js(riot_tag_line)])?,
+        )
+        .await
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlayerClaimOwner {
+    discord_user_id: String,
 }
 
 #[async_trait(?Send)]
 impl Storage for D1Storage {
     async fn upsert_player(&self, player: NewPlayer) -> StorageResult<()> {
+        self.ensure_player_claim_available(&player).await?;
         let sql = "
             INSERT INTO players (
                 guild_id, discord_user_id, riot_puuid, riot_game_name, riot_tag_line,
@@ -34,7 +148,7 @@ impl Storage for D1Storage {
                 riot_tag_line = excluded.riot_tag_line,
                 updated_at = excluded.updated_at
         ";
-        run(self.db.prepare(sql).bind(&[
+        let result = run(self.db.prepare(sql).bind(&[
             js(&player.guild_id),
             js(&player.discord_user_id),
             opt_js(player.riot_puuid.as_deref()),
@@ -42,7 +156,14 @@ impl Storage for D1Storage {
             js(&player.riot_tag_line),
             js_i64(player.now),
         ])?)
-        .await
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(StorageError::Backend(message)) => {
+                Err(self.map_player_claim_conflict(&player, message).await)
+            }
+            Err(other) => Err(other),
+        }
     }
 
     async fn get_player(&self, guild_id: &str, discord_user_id: &str) -> StorageResult<PlayerRow> {
@@ -60,6 +181,51 @@ impl Storage for D1Storage {
         )
         .await?
         .ok_or(StorageError::NotFound)
+    }
+
+    async fn get_player_by_riot_name(
+        &self,
+        guild_id: &str,
+        riot_name: &str,
+    ) -> StorageResult<Option<PlayerRow>> {
+        let riot_name = riot_name.trim();
+        if riot_name.is_empty() {
+            return Ok(None);
+        }
+        if let Some((game_name, tag_line)) = riot_name.split_once('#') {
+            return first(
+                self.db
+                    .prepare(
+                        "
+                        SELECT guild_id, discord_user_id, riot_puuid, riot_game_name,
+                               riot_tag_line, rating, wins, losses
+                        FROM players
+                        WHERE guild_id = ?1
+                          AND lower(riot_game_name) = lower(?2)
+                          AND lower(riot_tag_line) = lower(?3)
+                        LIMIT 1
+                        ",
+                    )
+                    .bind(&[js(guild_id), js(game_name.trim()), js(tag_line.trim())])?,
+            )
+            .await;
+        }
+        first(
+            self.db
+                .prepare(
+                    "
+                    SELECT guild_id, discord_user_id, riot_puuid, riot_game_name,
+                           riot_tag_line, rating, wins, losses
+                    FROM players
+                    WHERE guild_id = ?1
+                      AND lower(riot_game_name) = lower(?2)
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    ",
+                )
+                .bind(&[js(guild_id), js(riot_name)])?,
+        )
+        .await
     }
 
     async fn create_game(&self, game: NewGame, users: &[String]) -> StorageResult<()> {
@@ -188,11 +354,37 @@ impl Storage for D1Storage {
             self.db
                 .prepare(
                     "
-                    SELECT game_id, guild_id, channel_id, creator_discord_id, status, mode,
-                           winning_side, version, riot_match_id, consecutive_404
-                    FROM games
-                    WHERE guild_id = ?1 AND riot_match_id IS NOT NULL
-                    ORDER BY updated_at DESC
+                    SELECT g.game_id,
+                           g.guild_id,
+                           g.channel_id,
+                           g.creator_discord_id,
+                           g.status,
+                           g.mode,
+                           g.winning_side,
+                           g.version,
+                           g.riot_match_id,
+                           g.consecutive_404
+                    FROM games g
+                    WHERE g.guild_id = ?1
+                      AND (
+                          g.riot_match_id IS NOT NULL
+                          OR EXISTS (
+                              SELECT 1
+                              FROM matches m
+                              WHERE m.game_id = g.game_id
+                          )
+                      )
+                    ORDER BY MAX(
+                        g.updated_at,
+                        COALESCE(
+                            (
+                                SELECT MAX(m.finalized_at)
+                                FROM matches m
+                                WHERE m.game_id = g.game_id
+                            ),
+                            0
+                        )
+                    ) DESC
                     LIMIT 1
                     ",
                 )
@@ -210,11 +402,23 @@ impl Storage for D1Storage {
             self.db
                 .prepare(
                     "
-                    SELECT game_id, guild_id, channel_id, creator_discord_id, status, mode,
-                           winning_side, version, riot_match_id, consecutive_404
-                    FROM games
-                    WHERE guild_id = ?1 AND riot_match_id = ?2
-                    ORDER BY updated_at DESC
+                    SELECT g.game_id,
+                           g.guild_id,
+                           g.channel_id,
+                           g.creator_discord_id,
+                           g.status,
+                           g.mode,
+                           g.winning_side,
+                           g.version,
+                           COALESCE(m.riot_match_id, g.riot_match_id) AS riot_match_id,
+                           g.consecutive_404
+                    FROM games g
+                    LEFT JOIN matches m
+                      ON m.game_id = g.game_id
+                     AND m.riot_match_id = ?2
+                    WHERE g.guild_id = ?1
+                      AND (m.riot_match_id = ?2 OR g.riot_match_id = ?2)
+                    ORDER BY COALESCE(m.finalized_at, g.updated_at) DESC
                     LIMIT 1
                     ",
                 )
@@ -252,6 +456,37 @@ impl Storage for D1Storage {
                      AND p.discord_user_id = gp.discord_user_id
                     WHERE gp.game_id = ?1
                     ORDER BY gp.joined_at, gp.discord_user_id
+                    ",
+            )
+            .bind(&[js(game_id.as_str())])?)
+        .await
+    }
+
+    async fn matches_for_game(&self, game_id: &GameId) -> StorageResult<Vec<MatchLinkRow>> {
+        all(self
+            .db
+            .prepare(
+                "
+                    SELECT m.riot_match_id,
+                           m.data_source,
+                           m.queue_id,
+                           m.map_id,
+                           m.riot_game_mode,
+                           m.riot_game_type,
+                           m.finalized_at,
+                           COUNT(mp.puuid) AS participant_count
+                    FROM matches m
+                    LEFT JOIN match_participants mp
+                      ON mp.riot_match_id = m.riot_match_id
+                    WHERE m.game_id = ?1
+                    GROUP BY m.riot_match_id,
+                             m.data_source,
+                             m.queue_id,
+                             m.map_id,
+                             m.riot_game_mode,
+                             m.riot_game_type,
+                             m.finalized_at
+                    ORDER BY m.finalized_at DESC, m.riot_match_id DESC
                     ",
             )
             .bind(&[js(game_id.as_str())])?)
@@ -650,6 +885,79 @@ impl Storage for D1Storage {
             )
             .await
         }
+    }
+
+    async fn teammate_stats(
+        &self,
+        guild_id: &str,
+        discord_user_id: &str,
+        mode: Option<GameModeKind>,
+    ) -> StorageResult<Vec<TeammateStatsRow>> {
+        if let Some(mode) = mode {
+            return all(self
+                .db
+                .prepare(
+                    "
+                    SELECT other.discord_user_id,
+                           p.riot_game_name,
+                           p.riot_tag_line,
+                           COUNT(*) AS games,
+                           SUM(CASE WHEN g.winning_side = target.team THEN 1 ELSE 0 END) AS wins,
+                           SUM(CASE WHEN g.winning_side != target.team THEN 1 ELSE 0 END) AS losses
+                    FROM game_players target
+                    JOIN games g
+                      ON g.game_id = target.game_id
+                    JOIN game_players other
+                      ON other.game_id = target.game_id
+                     AND other.guild_id = target.guild_id
+                     AND other.team = target.team
+                     AND other.discord_user_id != target.discord_user_id
+                    JOIN players p
+                      ON p.guild_id = other.guild_id
+                     AND p.discord_user_id = other.discord_user_id
+                    WHERE target.guild_id = ?1
+                      AND target.discord_user_id = ?2
+                      AND target.team IS NOT NULL
+                      AND g.status = 'finalized'
+                      AND g.mode = ?3
+                    GROUP BY other.discord_user_id, p.riot_game_name, p.riot_tag_line
+                    ORDER BY games DESC, wins DESC, losses ASC, p.riot_game_name ASC
+                    ",
+                )
+                .bind(&[js(guild_id), js(discord_user_id), js(mode.as_str())])?)
+            .await;
+        }
+        all(self
+            .db
+            .prepare(
+                "
+                SELECT other.discord_user_id,
+                       p.riot_game_name,
+                       p.riot_tag_line,
+                       COUNT(*) AS games,
+                       SUM(CASE WHEN g.winning_side = target.team THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN g.winning_side != target.team THEN 1 ELSE 0 END) AS losses
+                FROM game_players target
+                JOIN games g
+                  ON g.game_id = target.game_id
+                JOIN game_players other
+                  ON other.game_id = target.game_id
+                 AND other.guild_id = target.guild_id
+                 AND other.team = target.team
+                 AND other.discord_user_id != target.discord_user_id
+                JOIN players p
+                  ON p.guild_id = other.guild_id
+                 AND p.discord_user_id = other.discord_user_id
+                WHERE target.guild_id = ?1
+                  AND target.discord_user_id = ?2
+                  AND target.team IS NOT NULL
+                  AND g.status = 'finalized'
+                GROUP BY other.discord_user_id, p.riot_game_name, p.riot_tag_line
+                ORDER BY games DESC, wins DESC, losses ASC, p.riot_game_name ASC
+                ",
+            )
+            .bind(&[js(guild_id), js(discord_user_id)])?)
+        .await
     }
 
     async fn leaderboard(

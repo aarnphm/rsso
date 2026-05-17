@@ -3,7 +3,7 @@ main = "crates/rsso-worker/build/worker/shim.mjs"
 compatibility_date = "2026-05-16"
 
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+command = "export RIOT_TXT=\"$(cat ../../riot.txt 2>/dev/null || true)\"; cargo install -q worker-build && worker-build --release"
 cwd = "crates/rsso-worker"
 watch_dir = "crates"
 

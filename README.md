@@ -20,22 +20,18 @@ The repo uses a Cargo workspace under `crates/`, `wrangler` for Cloudflare Worke
 ## Commands
 
 - `/register-summoners riot_id`
-- `/game mode user_1 ... user_10`
-- `/add game_id user`
-- `/randomize game_id`
-- `/result game_id winner`
-- `/results game_id? winner? riot_match_id? region?`
-- `/finish riot_match_id game_id? winner? region?`
-- `/hydrate game_id? riot_match_id? region?`
-- `/end game_id`
-- `/status game_id?`
-- `/stats user? mode?`
-- `/leaderboards mode?`
-- `/analysis mode?`
+- `/create user_1 user_2 ... user_10 mode?`
+- `/add user_1 ... user_10 game_id?`
+- `/winner game_id winner`
+- `/stats name? user? mode?`
+
+The Discord command manifest intentionally registers only those five commands. The code still has parser and handler paths for `game`, `randomize`, `result`, `results`, `finish`, `hydrate`, `link-match`, `end`, `status`, `leaderboards`, and `analysis`, because those are useful later once RSO-backed Riot match ingestion becomes a real product flow instead of slash-command clutter.
 
 ## Riot API Path
 
-`/register-summoners` accepts a Riot ID shaped as `GameName#TAG` and resolves it through Account-V1 when `RIOT_API_KEY` is configured. If the key is absent or the account is not found, it stores the claim without a PUUID so the in-house can still run in trust mode.
+The local-first flow is `/register-summoners`, `/create`, optionally `/add`, `/winner`, then `/stats`. `/create` assigns a 4-digit local game id, randomizes even teams immediately, and defaults to `ARAM: Mayhem` unless `mode` is passed. `/add` attaches extra players to the current open game and randomizes teams again when the resulting roster is even. `/winner game_id winner` finalizes W/L and ratings without waiting on Riot Match-V5, which matters because many custom-match backfill paths need RSO access.
+
+`/register-summoners` accepts a Riot ID shaped as `GameName#TAG` and resolves it through Account-V1 when `RIOT_API_KEY` is configured. If Riot lookup is unavailable, the command still stores a trusted claim so the local in-house flow can run.
 
 The scheduled worker runs every 3 minutes. For randomized or in-game rows, it probes Spectator-V5 by the first roster PUUID, validates that every known roster PUUID appears in the returned live game, validates the queue against the requested local mode, then marks the game `ingame` with the live Riot match id. Two consecutive Spectator 404s after `ingame` trigger a Match-V5 fetch; if Riot returns a valid roster and winner, the worker stores participant stats and finalizes automatically. If Match-V5 cannot see the match yet, the game stays on the manual `/end` or `/finish` path.
 
@@ -43,7 +39,9 @@ The scheduled worker runs every 3 minutes. For randomized or in-game rows, it pr
 
 `/finish riot_match_id game_id? winner? region?` fetches Match-V5 when the API key can see the match. It validates the match roster, derives the winner when Riot data has enough team info, writes `matches` plus `match_participants`, and finalizes rating/W-L state. Manual `winner` remains supported because Riot custom-match history is gated behind RSO for many flows. If Match-V5 returns 403, `/finish` can still close the game when `winner` is passed or the local game was already reported.
 
-`/hydrate game_id? riot_match_id? region?` retries Match-V5 for a linked game and backfills `match_participants` when Riot data becomes visible later. With no options, it targets the latest linked game in the guild. Numeric `riot_match_id` inputs use the same region normalization as `/finish`.
+`/hydrate game_id? riot_match_id? region?` retries Match-V5 for linked matches and backfills `match_participants` when Riot data becomes visible later. With no options, it targets the latest linked game in the guild and hydrates every linked match that is still missing Riot stats. With `game_id` and `riot_match_id`, it also attaches that Riot id to the local session if Riot still cannot return data yet. Numeric `riot_match_id` inputs use the same region normalization as `/finish`.
+
+`/link-match riot_match_id game_id? region?` attaches another Riot match id to a local game session without changing ratings or W/L. If `game_id` is omitted, it uses the current open game. This makes `games` the in-house session row and `matches` the one-to-many Riot match history under that session.
 
 ARAM and ARAM: Mayhem have first-class mode rows. Public ARAM queues validate against `450` and `2400`; custom games with queue `0` are accepted because in-house lobbies can report as custom queue data.
 
@@ -60,14 +58,16 @@ npx wrangler secret put DISCORD_BOT_TOKEN
 npx wrangler secret put RIOT_API_KEY
 ```
 
-3. Apply migrations:
+3. Place the Riot domain-verification file at repo root as `riot.txt`. The file is ignored by git and injected into the Worker during `wrangler deploy`; the deployed URL is `https://rsso.aarnphm.workers.dev/riot.txt`.
+
+4. Apply migrations:
 
 ```sh
 npm run d1:local
 npm run d1:remote
 ```
 
-4. Generate or register Discord commands:
+5. Generate or register Discord commands:
 
 ```sh
 cargo run -p rsso-cli -- discord commands-json
@@ -84,5 +84,6 @@ cargo clippy --all --benches --tests --examples --all-features
 cargo test
 cargo check -p rsso-worker --target wasm32-unknown-unknown
 npx wrangler deploy --dry-run
+curl -fsS https://rsso.aarnphm.workers.dev/riot.txt >/dev/null
 npm run d1:local
 ```

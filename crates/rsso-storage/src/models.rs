@@ -97,6 +97,16 @@ pub struct PlayerStatsRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeammateStatsRow {
+    pub discord_user_id: String,
+    pub riot_game_name: String,
+    pub riot_tag_line: String,
+    pub games: i64,
+    pub wins: i64,
+    pub losses: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardRow {
     pub discord_user_id: String,
     pub riot_game_name: String,
@@ -123,6 +133,24 @@ pub struct MatchRecord {
     pub data_source: String,
     pub payload_json: Option<String>,
     pub participants: Vec<ParticipantRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchLinkRow {
+    pub riot_match_id: String,
+    pub data_source: String,
+    pub queue_id: Option<i64>,
+    pub map_id: Option<i64>,
+    pub riot_game_mode: Option<String>,
+    pub riot_game_type: Option<String>,
+    pub finalized_at: i64,
+    pub participant_count: i64,
+}
+
+impl MatchLinkRow {
+    pub fn needs_hydration(&self) -> bool {
+        self.data_source != "match_v5" || self.participant_count == 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

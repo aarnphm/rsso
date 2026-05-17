@@ -1,6 +1,6 @@
 use crate::models::{
-    GameRow, LeaderboardRow, LiveGameUpdate, MatchRecord, NewGame, NewPlayer, PlayerRow,
-    PlayerStatsRow, RosterPlayer,
+    GameRow, LeaderboardRow, LiveGameUpdate, MatchLinkRow, MatchRecord, NewGame, NewPlayer,
+    PlayerRow, PlayerStatsRow, RosterPlayer, TeammateStatsRow,
 };
 use async_trait::async_trait;
 use rsso_domain::{GameId, GameModeKind, TeamAssignment, TeamSide};
@@ -16,6 +16,10 @@ pub enum StorageError {
     NotFound,
     #[error("an active game already exists for this guild")]
     ActiveGameExists,
+    #[error("that Riot account is already registered to <@{discord_user_id}> in this server")]
+    RiotPuuidAlreadyRegistered { discord_user_id: String },
+    #[error("that Riot ID is already registered to <@{discord_user_id}> in this server")]
+    RiotIdAlreadyRegistered { discord_user_id: String },
     #[error("game transition conflicted with another writer")]
     Conflict,
     #[error("invalid storage row: {0}")]
@@ -26,6 +30,11 @@ pub enum StorageError {
 pub trait Storage {
     async fn upsert_player(&self, player: NewPlayer) -> StorageResult<()>;
     async fn get_player(&self, guild_id: &str, discord_user_id: &str) -> StorageResult<PlayerRow>;
+    async fn get_player_by_riot_name(
+        &self,
+        guild_id: &str,
+        riot_name: &str,
+    ) -> StorageResult<Option<PlayerRow>>;
     async fn create_game(&self, game: NewGame, users: &[String]) -> StorageResult<()>;
     async fn add_player(
         &self,
@@ -46,6 +55,7 @@ pub trait Storage {
     ) -> StorageResult<Option<GameRow>>;
     async fn game_by_id(&self, game_id: &GameId) -> StorageResult<GameRow>;
     async fn roster(&self, game_id: &GameId) -> StorageResult<Vec<RosterPlayer>>;
+    async fn matches_for_game(&self, game_id: &GameId) -> StorageResult<Vec<MatchLinkRow>>;
     async fn assign_teams(
         &self,
         game_id: &GameId,
@@ -85,6 +95,12 @@ pub trait Storage {
         discord_user_id: &str,
         mode: Option<GameModeKind>,
     ) -> StorageResult<Option<PlayerStatsRow>>;
+    async fn teammate_stats(
+        &self,
+        guild_id: &str,
+        discord_user_id: &str,
+        mode: Option<GameModeKind>,
+    ) -> StorageResult<Vec<TeammateStatsRow>>;
     async fn leaderboard(
         &self,
         guild_id: &str,

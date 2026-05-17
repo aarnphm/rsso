@@ -35,6 +35,13 @@ pub fn deferred_response(ephemeral: bool) -> InteractionResponse {
     }
 }
 
+pub fn deferred_update_response() -> InteractionResponse {
+    InteractionResponse {
+        kind: 6,
+        data: None,
+    }
+}
+
 pub fn message_response(content: impl Into<String>, ephemeral: bool) -> InteractionResponse {
     InteractionResponse {
         kind: 4,

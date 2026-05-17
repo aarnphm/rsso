@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 pub enum InteractionType {
     Ping,
     ApplicationCommand,
+    MessageComponent,
     Other(u8),
 }
 
@@ -15,6 +16,7 @@ impl From<u8> for InteractionType {
         match value {
             1 => Self::Ping,
             2 => Self::ApplicationCommand,
+            3 => Self::MessageComponent,
             other => Self::Other(other),
         }
     }
@@ -25,6 +27,7 @@ impl From<InteractionType> for u8 {
         match value {
             InteractionType::Ping => 1,
             InteractionType::ApplicationCommand => 2,
+            InteractionType::MessageComponent => 3,
             InteractionType::Other(other) => other,
         }
     }
@@ -76,9 +79,14 @@ pub struct User {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplicationCommandData {
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub options: Vec<CommandOption>,
+    #[serde(default)]
+    pub custom_id: Option<String>,
+    #[serde(default)]
+    pub component_type: Option<u8>,
     #[serde(default)]
     pub resolved: Option<ResolvedData>,
 }

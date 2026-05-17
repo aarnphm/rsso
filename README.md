@@ -20,18 +20,20 @@ The repo uses a Cargo workspace under `crates/`, `wrangler` for Cloudflare Worke
 ## Commands
 
 - `/register-summoners riot_id`
-- `/create user_1 user_2 ... user_10 mode?`
+- `/create users mode?`
 - `/add user_1 ... user_10 game_id?`
-- `/winner game_id winner`
+- `/next`
+- `/winner game_id side`
 - `/stats name? user? mode?`
+- `/leaderboard mode?`
 
-The Discord command manifest intentionally registers only those five commands. The code still has parser and handler paths for `game`, `randomize`, `result`, `results`, `finish`, `hydrate`, `link-match`, `end`, `status`, `leaderboards`, and `analysis`, because those are useful later once RSO-backed Riot match ingestion becomes a real product flow instead of slash-command clutter.
+The Discord command manifest intentionally registers only those seven commands. The code still has parser and handler paths for `game`, `randomize`, `result`, `results`, `finish`, `hydrate`, `link-match`, `end`, `status`, legacy `leaderboards`, and `analysis`, because those are useful later once RSO-backed Riot match ingestion becomes a real product flow instead of slash-command clutter.
 
 ## Riot API Path
 
-The local-first flow is `/register-summoners`, `/create`, optionally `/add`, `/winner`, then `/stats`. `/create` assigns a 4-digit local game id, randomizes even teams immediately, and defaults to `ARAM: Mayhem` unless `mode` is passed. `/add` attaches extra players to the current open game and randomizes teams again when the resulting roster is even. `/winner game_id winner` finalizes W/L and ratings without waiting on Riot Match-V5, which matters because many custom-match backfill paths need RSO access.
+The local-first flow is `/create`, optionally `/add`, `/winner`, `/next`, `/register-summoners` when Riot IDs are known, then `/stats` or `/leaderboard`. `/create` accepts one `users` text field containing Discord mentions, assigns a `g_...` local game id, creates pending Discord-only player rows for anyone without a Riot ID yet, randomizes even teams immediately, posts a public team card, and defaults to `ARAM: Mayhem` unless `mode` is passed. `/add` attaches extra players to the current open game and posts a fresh team card when the resulting roster is even. `/next` copies the latest completed roster and advances to the next balanced side split, so repeated in-house games can rotate through the roster without retyping every player. The team card includes Red/Blue winner buttons, which call the same finalization path as `/winner game_id side`. `/winner` finalizes W/L and ratings without waiting on Riot Match-V5, which matters because many custom-match backfill paths need RSO access. `/stats` with no `user` or `name` returns a private everyone card; `/leaderboard` posts the public top rows; `/stats user:` or `/stats name:` returns a single-player rich card with Discord mentions, Riot ID when known, mode scope, record, rating, Match-V5 averages, and teammate pairings.
 
-`/register-summoners` accepts a Riot ID shaped as `GameName#TAG` and resolves it through Account-V1 when `RIOT_API_KEY` is configured. If Riot lookup is unavailable, the command still stores a trusted claim so the local in-house flow can run.
+`/register-summoners` accepts a Riot ID shaped as `GameName#TAG` and resolves it through Account-V1 when `RIOT_API_KEY` is configured. If Riot lookup is unavailable, the command still stores a trusted claim so the local in-house flow can run. If the player already joined games as pending, registration updates that same Discord row and preserves their local rating and record.
 
 The scheduled worker runs every 3 minutes. For randomized or in-game rows, it probes Spectator-V5 by the first roster PUUID, validates that every known roster PUUID appears in the returned live game, validates the queue against the requested local mode, then marks the game `ingame` with the live Riot match id. Two consecutive Spectator 404s after `ingame` trigger a Match-V5 fetch; if Riot returns a valid roster and winner, the worker stores participant stats and finalizes automatically. If Match-V5 cannot see the match yet, the game stays on the manual `/end` or `/finish` path.
 

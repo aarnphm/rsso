@@ -1,6 +1,21 @@
 use rsso_domain::{GameModeKind, GameStatus, TeamSide};
 use serde::{Deserialize, Serialize};
 
+pub const PENDING_RIOT_TAG_LINE: &str = "__PENDING__";
+
+pub fn pending_riot_game_name(discord_user_id: &str) -> String {
+    format!("__pending_{discord_user_id}")
+}
+
+pub fn is_pending_riot_id(
+    discord_user_id: &str,
+    riot_game_name: &str,
+    riot_tag_line: &str,
+) -> bool {
+    riot_tag_line == PENDING_RIOT_TAG_LINE
+        && riot_game_name == pending_riot_game_name(discord_user_id)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewPlayer {
     pub guild_id: String,

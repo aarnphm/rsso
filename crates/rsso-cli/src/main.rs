@@ -130,16 +130,7 @@ fn command_manifest() -> serde_json::Value {
             "name": "create",
             "description": "Create and randomize a local in-house game",
             "options": [
-                {"name": "user_1", "description": "Player 1", "type": 6, "required": true},
-                {"name": "user_2", "description": "Player 2", "type": 6, "required": true},
-                {"name": "user_3", "description": "Player 3", "type": 6, "required": false},
-                {"name": "user_4", "description": "Player 4", "type": 6, "required": false},
-                {"name": "user_5", "description": "Player 5", "type": 6, "required": false},
-                {"name": "user_6", "description": "Player 6", "type": 6, "required": false},
-                {"name": "user_7", "description": "Player 7", "type": 6, "required": false},
-                {"name": "user_8", "description": "Player 8", "type": 6, "required": false},
-                {"name": "user_9", "description": "Player 9", "type": 6, "required": false},
-                {"name": "user_10", "description": "Player 10", "type": 6, "required": false},
+                {"name": "users", "description": "Mention 2-10 users, for example @vu @chongly @cyracen @tanguan", "type": 3, "required": true},
                 {"name": "mode", "description": "Mode, defaults to ARAM: Mayhem", "type": 3, "required": false, "choices": mode_choices()}
             ]
         },
@@ -161,12 +152,16 @@ fn command_manifest() -> serde_json::Value {
             ]
         },
         {
+            "name": "next",
+            "description": "Create the next game from the latest roster rotation"
+        },
+        {
             "name": "winner",
             "description": "Finalize a local game by winning side",
             "options": [
                 {"name": "game_id", "description": "Local game id", "type": 3, "required": true},
                 {
-                    "name": "winner",
+                    "name": "side",
                     "description": "Winning side",
                     "type": 3,
                     "required": true,
@@ -183,6 +178,13 @@ fn command_manifest() -> serde_json::Value {
             "options": [
                 {"name": "name", "description": "Registered Riot game name or Riot ID", "type": 3, "required": false},
                 {"name": "user", "description": "Discord user", "type": 6, "required": false},
+                {"name": "mode", "description": "Mode filter", "type": 3, "required": false, "choices": mode_choices()}
+            ]
+        },
+        {
+            "name": "leaderboard",
+            "description": "Show the top in-house leaderboard",
+            "options": [
                 {"name": "mode", "description": "Mode filter", "type": 3, "required": false, "choices": mode_choices()}
             ]
         }

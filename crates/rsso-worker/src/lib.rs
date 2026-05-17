@@ -6,18 +6,26 @@ mod worker_entry {
         LiveGameStatus,
     };
     use rsso_discord::interaction::InteractionType;
-    use rsso_discord::response::{deferred_response, message_response, pong_response};
-    use rsso_discord::{parse_command, verify::verify_discord_request, Interaction};
-    use rsso_domain::{parse_riot_match_id, Rng};
+    use rsso_discord::response::{
+        deferred_response, deferred_update_response, message_response, pong_response,
+    };
+    use rsso_discord::{
+        parse_command, verify::verify_discord_request, DiscordCommand, Interaction, WinnerCommand,
+    };
+    use rsso_domain::{parse_riot_match_id, GameId, Rng, TeamSide};
     use rsso_handlers::{
-        handle_command_with_resolver, CommandContext, HandlerError, ResolvedRiotAccount,
-        ResolvedRiotMatch, ResolvedRiotParticipant, RiotAccountResolver, RiotMatchResolver,
+        handle_command_with_resolver, CommandContext, CommandResponse, HandlerError,
+        ResolvedRiotAccount, ResolvedRiotMatch, ResolvedRiotParticipant, RiotAccountResolver,
+        RiotMatchResolver, StatsCard, StatsOverviewCard, TeamCard,
     };
     use rsso_riot::routing::{
         account_by_riot_id_url, active_game_url, match_detail_url,
         match_regional_route_for_platform,
     };
-    use rsso_storage::d1::D1Storage;
+    use rsso_storage::{
+        d1::D1Storage, GameRow, MatchLinkRow, PlayerStatsRow, RosterPlayer, Storage,
+    };
+    use serde::Serialize;
     use worker::{
         event, Context, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result,
         ScheduleContext,
@@ -97,6 +105,10 @@ mod worker_entry {
             return Response::from_json(&pong_response());
         }
 
+        if interaction.kind == InteractionType::MessageComponent {
+            return handle_component_interaction(interaction, env, ctx).await;
+        }
+
         let Some(data) = interaction.data.as_ref() else {
             return Response::from_json(&message_response("Missing command data.", true));
         };
@@ -125,11 +137,12 @@ mod worker_entry {
             actor_id,
             now: now(),
         };
+        let ephemeral = command_initial_ephemeral(&command);
         let application_id = interaction.application_id;
         let token = interaction.token;
         let background_env = env.clone();
         ctx.wait_until(async move {
-            let content = match background_env.d1("DB") {
+            let message = match background_env.d1("DB") {
                 Ok(db) => {
                     let storage = D1Storage::new(db);
                     let resolver = WorkerRiotAccountResolver::from_env(&background_env);
@@ -139,17 +152,341 @@ mod worker_entry {
                     )
                     .await
                     {
-                        Ok(content) => content,
-                        Err(error) => format!("{error}"),
+                        Ok(response) => discord_message_from_response(&response),
+                        Err(error) => DiscordWebhookMessage::plain(format!("{error}")),
                     }
                 }
-                Err(error) => format!("D1 binding error: {error}"),
+                Err(error) => DiscordWebhookMessage::plain(format!("D1 binding error: {error}")),
             };
-            if let Err(error) = edit_original_response(&application_id, &token, &content).await {
+            if let Err(error) = edit_original_response(&application_id, &token, &message).await {
                 worker::console_error!("discord followup failed: {error}");
             }
         });
-        Response::from_json(&deferred_response(true))
+        Response::from_json(&deferred_response(ephemeral))
+    }
+
+    async fn handle_component_interaction(
+        interaction: Interaction,
+        env: Env,
+        ctx: Context,
+    ) -> Result<Response> {
+        let Some(data) = interaction.data.as_ref() else {
+            return Response::from_json(&message_response("Missing component data.", true));
+        };
+        let Some(custom_id) = data.custom_id.as_deref() else {
+            return Response::from_json(&message_response("Missing component id.", true));
+        };
+        let Some((game_id, winner)) = parse_winner_button_id(custom_id) else {
+            return Response::from_json(&message_response("Unknown button.", true));
+        };
+        let Some(guild_id) = interaction.guild_id.clone() else {
+            return Response::from_json(&message_response("Guild buttons only for now.", true));
+        };
+        let Some(channel_id) = interaction.channel_id.clone() else {
+            return Response::from_json(&message_response("Missing channel id.", true));
+        };
+        let Some(actor_id) = interaction.actor_user_id().map(str::to_owned) else {
+            return Response::from_json(&message_response("Missing actor id.", true));
+        };
+
+        let context = CommandContext {
+            guild_id,
+            channel_id,
+            actor_id,
+            now: now(),
+        };
+        let application_id = interaction.application_id;
+        let token = interaction.token;
+        let background_env = env.clone();
+        ctx.wait_until(async move {
+            let summary_game_id = game_id.clone();
+            let actor_id = context.actor_id.clone();
+            let command = DiscordCommand::Winner(WinnerCommand { game_id, winner });
+            let message = match background_env.d1("DB") {
+                Ok(db) => {
+                    let storage = D1Storage::new(db);
+                    let resolver = WorkerRiotAccountResolver::from_env(&background_env);
+                    let mut rng = WorkerRng::new();
+                    match handle_command_with_resolver(
+                        &storage, &resolver, context, command, &mut rng,
+                    )
+                    .await
+                    {
+                        Ok(response) => match result_message_for_game(
+                            &storage,
+                            &summary_game_id,
+                            winner,
+                            &actor_id,
+                            response.content,
+                        )
+                        .await
+                        {
+                            Ok(message) => message,
+                            Err(error) => DiscordWebhookMessage::plain(format!(
+                                "Marked game {} won by {}.\nCould not load result card: {error}",
+                                summary_game_id,
+                                winner.as_str()
+                            ))
+                            .clear_rich_state(),
+                        },
+                        Err(error) => match result_message_for_game(
+                            &storage,
+                            &summary_game_id,
+                            winner,
+                            &actor_id,
+                            format!("{error}"),
+                        )
+                        .await
+                        {
+                            Ok(message) => message,
+                            Err(_) => {
+                                DiscordWebhookMessage::plain(format!("{error}")).clear_rich_state()
+                            }
+                        },
+                    }
+                }
+                Err(error) => DiscordWebhookMessage::plain(format!("D1 binding error: {error}")),
+            };
+            if let Err(error) = edit_original_response(&application_id, &token, &message).await {
+                worker::console_error!("discord button update failed: {error}");
+            }
+        });
+        Response::from_json(&deferred_update_response())
+    }
+
+    async fn result_message_for_game<S: Storage + ?Sized>(
+        storage: &S,
+        game_id: &GameId,
+        fallback_winner: TeamSide,
+        actor_id: &str,
+        content: String,
+    ) -> std::result::Result<DiscordWebhookMessage, String> {
+        let game = storage
+            .game_by_id(game_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mode = game
+            .mode()
+            .map_err(|error| format!("invalid stored mode: {error}"))?;
+        let recorded_winner = game
+            .winning_side
+            .as_deref()
+            .and_then(|side| side.parse().ok());
+        let roster = storage
+            .roster(game_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let links = storage
+            .matches_for_game(game_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut red = Vec::new();
+        let mut blue = Vec::new();
+        for player in roster {
+            let stats = storage
+                .stats_for_player(&game.guild_id, &player.discord_user_id, Some(mode))
+                .await
+                .map_err(|error| error.to_string())?;
+            let line = player_result_line(&player, stats.as_ref());
+            match player.team_side() {
+                Some(TeamSide::Red) => red.push(line),
+                Some(TeamSide::Blue) => blue.push(line),
+                None => {}
+            }
+        }
+
+        Ok(DiscordWebhookMessage {
+            content,
+            embeds: Some(vec![result_embed(
+                &game,
+                recorded_winner,
+                fallback_winner,
+                actor_id,
+                &team_lines(red),
+                &team_lines(blue),
+                &match_lines(&game, &links),
+            )]),
+            components: Some(Vec::new()),
+        })
+    }
+
+    fn result_embed(
+        game: &GameRow,
+        recorded_winner: Option<TeamSide>,
+        fallback_winner: TeamSide,
+        actor_id: &str,
+        red: &str,
+        blue: &str,
+        matches: &str,
+    ) -> DiscordEmbed {
+        let display_winner = recorded_winner.unwrap_or(fallback_winner);
+        let (title, description, color) = if recorded_winner.is_some() {
+            (
+                format!("{} wins {}", team_title(display_winner), game.game_id),
+                "Result recorded and ratings updated.".to_owned(),
+                team_color(display_winner),
+            )
+        } else {
+            (
+                format!("Game {}", game.game_id),
+                "No winner is recorded yet.".to_owned(),
+                0xfee75c,
+            )
+        };
+        DiscordEmbed {
+            title,
+            description,
+            color,
+            fields: vec![
+                DiscordEmbedField {
+                    name: "Current match".to_owned(),
+                    value: matches.to_owned(),
+                    inline: false,
+                },
+                DiscordEmbedField {
+                    name: team_field_name(TeamSide::Red, recorded_winner),
+                    value: red.to_owned(),
+                    inline: true,
+                },
+                DiscordEmbedField {
+                    name: team_field_name(TeamSide::Blue, recorded_winner),
+                    value: blue.to_owned(),
+                    inline: true,
+                },
+            ],
+            footer: DiscordEmbedFooter {
+                text: format!("Winner button used by {actor_id}"),
+            },
+        }
+    }
+
+    fn team_field_name(team: TeamSide, winner: Option<TeamSide>) -> String {
+        if winner == Some(team) {
+            format!("{} team (winner)", team_title(team))
+        } else {
+            format!("{} team", team_title(team))
+        }
+    }
+
+    fn team_title(team: TeamSide) -> &'static str {
+        match team {
+            TeamSide::Red => "Red",
+            TeamSide::Blue => "Blue",
+        }
+    }
+
+    fn team_color(team: TeamSide) -> u32 {
+        match team {
+            TeamSide::Red => 0xed4245,
+            TeamSide::Blue => 0x5865f2,
+        }
+    }
+
+    fn team_lines(lines: Vec<String>) -> String {
+        if lines.is_empty() {
+            return "none".to_owned();
+        }
+        let mut value = lines.join("\n");
+        truncate_embed_value(&mut value);
+        value
+    }
+
+    fn player_result_line(player: &RosterPlayer, stats: Option<&PlayerStatsRow>) -> String {
+        let Some(stats) = stats else {
+            return format!(
+                "<@{}> - {} rating - no record yet",
+                player.discord_user_id, player.rating
+            );
+        };
+        let avg = match (
+            stats.avg_kills,
+            stats.avg_deaths,
+            stats.avg_assists,
+            stats.avg_total_damage,
+        ) {
+            (Some(kills), Some(deaths), Some(assists), Some(damage)) => {
+                format!(
+                    " - {:.1}/{:.1}/{:.1} - {:.0} avg dmg",
+                    kills, deaths, assists, damage
+                )
+            }
+            (Some(kills), Some(deaths), Some(assists), None) => {
+                format!(" - {:.1}/{:.1}/{:.1}", kills, deaths, assists)
+            }
+            _ => String::new(),
+        };
+        format!(
+            "<@{}> - {} rating - {}W/{}L - {:.1}% WR{}",
+            stats.discord_user_id,
+            stats.rating,
+            stats.wins,
+            stats.losses,
+            stats.win_rate * 100.0,
+            avg
+        )
+    }
+
+    fn match_lines(game: &GameRow, links: &[MatchLinkRow]) -> String {
+        let status = game
+            .status()
+            .map_or_else(|_| game.status.clone(), |status| status.as_str().to_owned());
+        let mut lines = vec![
+            format!("Local game: `{}`", game.game_id),
+            format!("Mode: `{}`", game.mode),
+            format!("Status: `{status}`"),
+            format!(
+                "Riot match: {}",
+                game.riot_match_id
+                    .as_ref()
+                    .map_or("pending".to_owned(), |match_id| format!("`{match_id}`"))
+            ),
+        ];
+        if links.is_empty() {
+            lines.push("Match-V5 stats: pending".to_owned());
+        } else {
+            for link in links.iter().take(3) {
+                lines.push(format!(
+                    "`{}` - {} - {} participant row(s)",
+                    link.riot_match_id, link.data_source, link.participant_count
+                ));
+            }
+            if links.len() > 3 {
+                lines.push(format!("{} more linked match(es)", links.len() - 3));
+            }
+        }
+        let mut value = lines.join("\n");
+        truncate_embed_value(&mut value);
+        value
+    }
+
+    fn command_initial_ephemeral(command: &DiscordCommand) -> bool {
+        !matches!(
+            command,
+            DiscordCommand::Create(_)
+                | DiscordCommand::Add(_)
+                | DiscordCommand::Next
+                | DiscordCommand::Winner(_)
+                | DiscordCommand::Game(_)
+                | DiscordCommand::Result { .. }
+                | DiscordCommand::Results(_)
+                | DiscordCommand::Finish(_)
+                | DiscordCommand::LinkMatch(_)
+                | DiscordCommand::End { .. }
+                | DiscordCommand::Leaderboards { .. }
+        )
+    }
+
+    fn parse_winner_button_id(custom_id: &str) -> Option<(GameId, TeamSide)> {
+        let mut parts = custom_id.split(':');
+        if parts.next()? != "rsso" || parts.next()? != "winner" {
+            return None;
+        }
+        let game_id = GameId::new(parts.next()?);
+        let winner = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((game_id, winner))
     }
 
     fn now() -> i64 {
@@ -182,21 +519,358 @@ mod worker_entry {
         }
     }
 
+    #[derive(Debug, Serialize)]
+    struct DiscordWebhookMessage {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        embeds: Option<Vec<DiscordEmbed>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        components: Option<Vec<DiscordActionRow>>,
+    }
+
+    impl DiscordWebhookMessage {
+        fn plain(content: impl Into<String>) -> Self {
+            Self {
+                content: content.into(),
+                embeds: None,
+                components: None,
+            }
+        }
+
+        fn clear_rich_state(mut self) -> Self {
+            self.embeds = Some(Vec::new());
+            self.components = Some(Vec::new());
+            self
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    struct DiscordEmbed {
+        title: String,
+        description: String,
+        color: u32,
+        fields: Vec<DiscordEmbedField>,
+        footer: DiscordEmbedFooter,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct DiscordEmbedField {
+        name: String,
+        value: String,
+        inline: bool,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct DiscordEmbedFooter {
+        text: String,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct DiscordActionRow {
+        #[serde(rename = "type")]
+        kind: u8,
+        components: Vec<DiscordButton>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct DiscordButton {
+        #[serde(rename = "type")]
+        kind: u8,
+        style: u8,
+        label: String,
+        custom_id: String,
+    }
+
+    fn discord_message_from_response(response: &CommandResponse) -> DiscordWebhookMessage {
+        if let Some(stats_overview_card) = response.stats_overview_card.as_ref() {
+            return DiscordWebhookMessage {
+                content: "Stats for everyone".to_owned(),
+                embeds: Some(vec![stats_overview_embed(stats_overview_card)]),
+                components: None,
+            };
+        }
+
+        if let Some(stats_card) = response.stats_card.as_ref() {
+            return DiscordWebhookMessage {
+                content: format!("Stats for <@{}>", stats_card.discord_user_id.as_str()),
+                embeds: Some(vec![stats_embed(stats_card)]),
+                components: None,
+            };
+        }
+
+        if let Some(team_card) = response.team_card.as_ref() {
+            return DiscordWebhookMessage {
+                content: response.content.clone(),
+                embeds: Some(vec![team_embed(team_card)]),
+                components: Some(vec![winner_button_row(&team_card.game_id)]),
+            };
+        }
+
+        DiscordWebhookMessage::plain(response.content.clone())
+    }
+
+    fn stats_overview_embed(stats_overview_card: &StatsOverviewCard) -> DiscordEmbed {
+        DiscordEmbed {
+            title: "In-house stats".to_owned(),
+            description: format!("Mode: {}", stats_overview_card.mode_label),
+            color: 0x5865f2,
+            fields: stats_overview_fields(stats_overview_card),
+            footer: DiscordEmbedFooter {
+                text: format!("Showing {} player(s).", stats_overview_card.rows.len()),
+            },
+        }
+    }
+
+    fn stats_overview_fields(stats_overview_card: &StatsOverviewCard) -> Vec<DiscordEmbedField> {
+        const OVERVIEW_FIELD_BUDGET: usize = 5_000;
+
+        if stats_overview_card.rows.is_empty() {
+            return vec![DiscordEmbedField {
+                name: "Players".to_owned(),
+                value: "none yet".to_owned(),
+                inline: false,
+            }];
+        }
+
+        let mut fields = Vec::new();
+        let mut lines = Vec::new();
+        let mut current_len = 0_usize;
+        let mut used_len = 0_usize;
+        for (index, row) in stats_overview_card.rows.iter().enumerate() {
+            let mut line = stats_overview_line(row);
+            truncate_embed_value(&mut line);
+            let separator_len = usize::from(!lines.is_empty());
+            if used_len + separator_len + line.len() > OVERVIEW_FIELD_BUDGET {
+                let remaining = stats_overview_card.rows.len() - index;
+                let overflow =
+                    format!("{remaining} more player(s) omitted by Discord embed limits.");
+                if current_len + separator_len + overflow.len() <= 1024 {
+                    lines.push(overflow);
+                }
+                break;
+            }
+            if current_len + separator_len + line.len() > 1024 && !lines.is_empty() {
+                fields.push(DiscordEmbedField {
+                    name: stats_overview_field_name(fields.len()),
+                    value: lines.join("\n"),
+                    inline: false,
+                });
+                lines.clear();
+                current_len = 0;
+                if fields.len() == 24 {
+                    break;
+                }
+            }
+            current_len += usize::from(!lines.is_empty()) + line.len();
+            used_len += separator_len + line.len();
+            lines.push(line);
+        }
+        if !lines.is_empty() && fields.len() < 25 {
+            fields.push(DiscordEmbedField {
+                name: stats_overview_field_name(fields.len()),
+                value: lines.join("\n"),
+                inline: false,
+            });
+        }
+        fields
+    }
+
+    fn stats_overview_field_name(index: usize) -> String {
+        if index == 0 {
+            "Players".to_owned()
+        } else {
+            format!("Players {}", index + 1)
+        }
+    }
+
+    fn stats_overview_line(row: &rsso_handlers::StatsOverviewRow) -> String {
+        let mut line = format!(
+            "{}. <@{}> - `{}` - {}W/{}L - {} WR - {} rating",
+            row.rank,
+            row.discord_user_id.as_str(),
+            row.riot_id,
+            row.wins,
+            row.losses,
+            row.win_rate,
+            row.rating
+        );
+        if let Some(kda) = row.kda.as_ref() {
+            line.push_str(&format!(" - {kda}"));
+        }
+        if let Some(damage) = row.average_damage.as_ref() {
+            line.push_str(&format!(" - {damage}"));
+        }
+        line
+    }
+
+    fn stats_embed(stats_card: &StatsCard) -> DiscordEmbed {
+        DiscordEmbed {
+            title: format!("Stats for {}", stats_card.riot_id),
+            description: format!(
+                "<@{}> - {}",
+                stats_card.discord_user_id.as_str(),
+                stats_card.mode_label
+            ),
+            color: stats_color(stats_card),
+            fields: vec![
+                DiscordEmbedField {
+                    name: "Player".to_owned(),
+                    value: format!(
+                        "<@{}>\n`{}`\nMode: `{}`",
+                        stats_card.discord_user_id.as_str(),
+                        stats_card.riot_id,
+                        stats_card.mode_label
+                    ),
+                    inline: true,
+                },
+                DiscordEmbedField {
+                    name: "Record".to_owned(),
+                    value: format!(
+                        "{}W / {}L\n{} games\n{} WR\n{} rating",
+                        stats_card.wins,
+                        stats_card.losses,
+                        stats_card.games_total,
+                        stats_card.win_rate,
+                        stats_card.rating
+                    ),
+                    inline: true,
+                },
+                DiscordEmbedField {
+                    name: "Averages".to_owned(),
+                    value: stats_averages(stats_card),
+                    inline: true,
+                },
+                DiscordEmbedField {
+                    name: "Most won with".to_owned(),
+                    value: embed_lines(&stats_card.most_won_with, "none yet"),
+                    inline: false,
+                },
+                DiscordEmbedField {
+                    name: "Most lost with".to_owned(),
+                    value: embed_lines(&stats_card.most_lost_with, "none yet"),
+                    inline: false,
+                },
+            ],
+            footer: DiscordEmbedFooter {
+                text: "Stats update after /winner or hydrated Match-V5 rows.".to_owned(),
+            },
+        }
+    }
+
+    fn stats_color(stats_card: &StatsCard) -> u32 {
+        if stats_card.games_total == 0 {
+            0xfee75c
+        } else if stats_card.wins >= stats_card.losses {
+            0x57f287
+        } else {
+            0xed4245
+        }
+    }
+
+    fn stats_averages(stats_card: &StatsCard) -> String {
+        let mut lines = Vec::new();
+        if let Some(kda) = stats_card.kda.as_ref() {
+            lines.push(kda.clone());
+        }
+        if let Some(damage) = stats_card.average_damage.as_ref() {
+            lines.push(damage.clone());
+        }
+        embed_lines(&lines, "No Match-V5 averages yet.")
+    }
+
+    fn embed_lines(lines: &[String], empty: &str) -> String {
+        if lines.is_empty() {
+            return empty.to_owned();
+        }
+        let mut value = lines.join("\n");
+        truncate_embed_value(&mut value);
+        value
+    }
+
+    fn truncate_embed_value(value: &mut String) {
+        const DISCORD_EMBED_FIELD_LIMIT: usize = 1024;
+        const ELLIPSIS_LEN: usize = 3;
+        if value.len() <= DISCORD_EMBED_FIELD_LIMIT {
+            return;
+        }
+        let mut boundary = DISCORD_EMBED_FIELD_LIMIT - ELLIPSIS_LEN;
+        while !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
+        value.push_str("...");
+    }
+
+    fn team_embed(team_card: &TeamCard) -> DiscordEmbed {
+        DiscordEmbed {
+            title: format!("In-house {}", team_card.game_id),
+            description: format!("Mode: {}", team_card.mode.as_str()),
+            color: 0x5865f2,
+            fields: vec![
+                DiscordEmbedField {
+                    name: "🔴 Red team".to_owned(),
+                    value: mentions_or_empty(&team_card.red),
+                    inline: true,
+                },
+                DiscordEmbedField {
+                    name: "🔵 Blue team".to_owned(),
+                    value: mentions_or_empty(&team_card.blue),
+                    inline: true,
+                },
+            ],
+            footer: DiscordEmbedFooter {
+                text: "Use the buttons when the game ends.".to_owned(),
+            },
+        }
+    }
+
+    fn mentions_or_empty(users: &[rsso_domain::DiscordUserId]) -> String {
+        if users.is_empty() {
+            return "none".to_owned();
+        }
+        users
+            .iter()
+            .map(|user| format!("<@{}>", user.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn winner_button_row(game_id: &GameId) -> DiscordActionRow {
+        DiscordActionRow {
+            kind: 1,
+            components: vec![
+                DiscordButton {
+                    kind: 2,
+                    style: 4,
+                    label: "Red wins".to_owned(),
+                    custom_id: format!("rsso:winner:{game_id}:red"),
+                },
+                DiscordButton {
+                    kind: 2,
+                    style: 1,
+                    label: "Blue wins".to_owned(),
+                    custom_id: format!("rsso:winner:{game_id}:blue"),
+                },
+            ],
+        }
+    }
+
     async fn edit_original_response(
         application_id: &str,
         token: &str,
-        content: &str,
+        message: &DiscordWebhookMessage,
     ) -> Result<()> {
         let url = format!(
             "https://discord.com/api/v10/webhooks/{application_id}/{token}/messages/@original"
         );
         let headers = Headers::new();
         headers.set("Content-Type", "application/json")?;
-        let body = serde_json::json!({ "content": content });
+        let body = serde_json::to_string(message)
+            .map_err(|err| worker::Error::RustError(format!("discord message json: {err}")))?;
         let mut init = RequestInit::new();
         init.with_method(Method::Patch)
             .with_headers(headers)
-            .with_body(Some(wasm_bindgen::JsValue::from_str(&body.to_string())));
+            .with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
         let request = Request::new_with_init(&url, &init)?;
         let response = Fetch::Request(request).send().await?;
         if (200..300).contains(&response.status_code()) {

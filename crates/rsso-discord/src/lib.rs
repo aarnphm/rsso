@@ -8,4 +8,6 @@ pub use command::{
     GameCommand, HydrateCommand, LinkMatchCommand, ResultsCommand, StatsCommand, WinnerCommand,
 };
 pub use interaction::{ApplicationCommandData, CommandOption, Interaction, InteractionType};
-pub use response::{deferred_response, message_response, InteractionResponse};
+pub use response::{
+    deferred_response, deferred_update_response, message_response, InteractionResponse,
+};

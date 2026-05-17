@@ -28,6 +28,12 @@ pub enum StorageError {
 
 #[async_trait(?Send)]
 pub trait Storage {
+    async fn ensure_player(
+        &self,
+        guild_id: &str,
+        discord_user_id: &str,
+        now: i64,
+    ) -> StorageResult<()>;
     async fn upsert_player(&self, player: NewPlayer) -> StorageResult<()>;
     async fn get_player(&self, guild_id: &str, discord_user_id: &str) -> StorageResult<PlayerRow>;
     async fn get_player_by_riot_name(
@@ -44,6 +50,7 @@ pub trait Storage {
         now: i64,
     ) -> StorageResult<()>;
     async fn open_game_for_guild(&self, guild_id: &str) -> StorageResult<Option<GameRow>>;
+    async fn latest_game_for_guild(&self, guild_id: &str) -> StorageResult<Option<GameRow>>;
     async fn latest_game_with_match_for_guild(
         &self,
         guild_id: &str,

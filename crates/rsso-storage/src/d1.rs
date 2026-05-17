@@ -1,6 +1,7 @@
 use crate::models::{
-    GameRow, LeaderboardRow, LiveGameUpdate, MatchLinkRow, MatchRecord, NewGame, NewPlayer,
-    PlayerRow, PlayerStatsRow, RosterPlayer, TeammateStatsRow,
+    pending_riot_game_name, GameRow, LeaderboardRow, LiveGameUpdate, MatchLinkRow, MatchRecord,
+    NewGame, NewPlayer, PlayerRow, PlayerStatsRow, RosterPlayer, TeammateStatsRow,
+    PENDING_RIOT_TAG_LINE,
 };
 use crate::repository::{Storage, StorageError, StorageResult};
 use async_trait::async_trait;
@@ -134,6 +135,34 @@ struct PlayerClaimOwner {
 
 #[async_trait(?Send)]
 impl Storage for D1Storage {
+    async fn ensure_player(
+        &self,
+        guild_id: &str,
+        discord_user_id: &str,
+        now: i64,
+    ) -> StorageResult<()> {
+        run(self
+            .db
+            .prepare(
+                "
+                INSERT INTO players (
+                    guild_id, discord_user_id, riot_puuid, riot_game_name, riot_tag_line,
+                    claim_status, consented_at, created_at, updated_at
+                )
+                VALUES (?1, ?2, NULL, ?3, ?4, 'trusted', ?5, ?5, ?5)
+                ON CONFLICT(guild_id, discord_user_id) DO NOTHING
+                ",
+            )
+            .bind(&[
+                js(guild_id),
+                js(discord_user_id),
+                js(&pending_riot_game_name(discord_user_id)),
+                js(PENDING_RIOT_TAG_LINE),
+                js_i64(now),
+            ])?)
+        .await
+    }
+
     async fn upsert_player(&self, player: NewPlayer) -> StorageResult<()> {
         self.ensure_player_claim_available(&player).await?;
         let sql = "
@@ -229,6 +258,13 @@ impl Storage for D1Storage {
     }
 
     async fn create_game(&self, game: NewGame, users: &[String]) -> StorageResult<()> {
+        self.ensure_player(&game.guild_id, &game.creator_discord_id, game.now)
+            .await?;
+        for discord_user_id in users {
+            self.ensure_player(&game.guild_id, discord_user_id, game.now)
+                .await?;
+        }
+
         let insert_game = self
             .db
             .prepare(
@@ -277,6 +313,7 @@ impl Storage for D1Storage {
         if !matches!(status, GameStatus::Lobby | GameStatus::Randomized) {
             return Err(StorageError::Conflict);
         }
+        self.ensure_player(guild_id, discord_user_id, now).await?;
         let player = self.get_player(guild_id, discord_user_id).await?;
         run(self
             .db
@@ -337,6 +374,24 @@ impl Storage for D1Storage {
                            winning_side, version, riot_match_id, consecutive_404
                     FROM games
                     WHERE guild_id = ?1 AND is_open IS NOT NULL
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    ",
+                )
+                .bind(&[js(guild_id)])?,
+        )
+        .await
+    }
+
+    async fn latest_game_for_guild(&self, guild_id: &str) -> StorageResult<Option<GameRow>> {
+        first(
+            self.db
+                .prepare(
+                    "
+                    SELECT game_id, guild_id, channel_id, creator_discord_id, status, mode,
+                           winning_side, version, riot_match_id, consecutive_404
+                    FROM games
+                    WHERE guild_id = ?1
                     ORDER BY created_at DESC
                     LIMIT 1
                     ",

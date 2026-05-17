@@ -9,11 +9,14 @@ use rsso_domain::{
 };
 use rsso_riot::parse_riot_id;
 use rsso_storage::{
-    GameRow, MatchLinkRow, MatchRecord, NewGame, NewPlayer, ParticipantRecord, PlayerStatsRow,
-    RosterPlayer, Storage, StorageError, TeammateStatsRow,
+    is_pending_riot_id, GameRow, LeaderboardRow, MatchLinkRow, MatchRecord, NewGame, NewPlayer,
+    ParticipantRecord, PlayerStatsRow, RosterPlayer, Storage, StorageError, TeammateStatsRow,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+const STATS_OVERVIEW_LIMIT: u8 = 100;
+const LEADERBOARD_LIMIT: u8 = 10;
 
 #[derive(Debug, Clone)]
 pub struct CommandContext {
@@ -29,6 +32,102 @@ pub enum HandlerError {
     UserFacing(String),
     #[error(transparent)]
     Storage(#[from] StorageError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandAudience {
+    Ephemeral,
+    Public,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResponse {
+    pub content: String,
+    pub audience: CommandAudience,
+    pub team_card: Option<TeamCard>,
+    pub stats_card: Option<StatsCard>,
+    pub stats_overview_card: Option<StatsOverviewCard>,
+}
+
+impl CommandResponse {
+    pub fn ephemeral(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            audience: CommandAudience::Ephemeral,
+            team_card: None,
+            stats_card: None,
+            stats_overview_card: None,
+        }
+    }
+
+    pub fn public(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            audience: CommandAudience::Public,
+            team_card: None,
+            stats_card: None,
+            stats_overview_card: None,
+        }
+    }
+
+    pub fn with_team_card(mut self, team_card: TeamCard) -> Self {
+        self.team_card = Some(team_card);
+        self
+    }
+
+    pub fn with_stats_card(mut self, stats_card: StatsCard) -> Self {
+        self.stats_card = Some(stats_card);
+        self
+    }
+
+    pub fn with_stats_overview_card(mut self, stats_overview_card: StatsOverviewCard) -> Self {
+        self.stats_overview_card = Some(stats_overview_card);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamCard {
+    pub game_id: GameId,
+    pub mode: GameModeKind,
+    pub red: Vec<DiscordUserId>,
+    pub blue: Vec<DiscordUserId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsCard {
+    pub discord_user_id: DiscordUserId,
+    pub riot_id: String,
+    pub mode_label: String,
+    pub rating: i32,
+    pub wins: i32,
+    pub losses: i32,
+    pub games_total: i32,
+    pub win_rate: String,
+    pub kda: Option<String>,
+    pub average_damage: Option<String>,
+    pub most_won_with: Vec<String>,
+    pub most_lost_with: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsOverviewCard {
+    pub mode_label: String,
+    pub rows: Vec<StatsOverviewRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsOverviewRow {
+    pub rank: usize,
+    pub discord_user_id: DiscordUserId,
+    pub riot_id: String,
+    pub rating: i32,
+    pub wins: i32,
+    pub losses: i32,
+    pub games_total: i32,
+    pub win_rate: String,
+    pub kda: Option<String>,
+    pub average_damage: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +210,9 @@ pub async fn handle_command<S: Storage + ?Sized>(
     command: DiscordCommand,
     rng: &mut impl Rng,
 ) -> Result<String, HandlerError> {
-    handle_command_with_resolver(storage, &NoopRiotAccountResolver, context, command, rng).await
+    handle_command_with_resolver(storage, &NoopRiotAccountResolver, context, command, rng)
+        .await
+        .map(|response| response.content)
 }
 
 pub async fn handle_command_with_resolver<
@@ -123,67 +224,65 @@ pub async fn handle_command_with_resolver<
     context: CommandContext,
     command: DiscordCommand,
     rng: &mut impl Rng,
-) -> Result<String, HandlerError> {
+) -> Result<CommandResponse, HandlerError> {
     match command {
         DiscordCommand::RegisterSummoners { riot_id } => {
-            handle_register(storage, resolver, context, &riot_id).await
+            handle_register(storage, resolver, context, &riot_id)
+                .await
+                .map(CommandResponse::ephemeral)
         }
         DiscordCommand::Create(command) => handle_create(storage, context, command, rng).await,
-        DiscordCommand::Game(command) => handle_game(storage, context, command, rng).await,
+        DiscordCommand::Game(command) => handle_game(storage, context, command, rng)
+            .await
+            .map(CommandResponse::public),
         DiscordCommand::Add(command) => handle_add(storage, context, command, rng).await,
-        DiscordCommand::Randomize { game_id } => {
-            handle_randomize(storage, context, game_id, rng).await
-        }
+        DiscordCommand::Next => handle_next(storage, context).await,
+        DiscordCommand::Randomize { game_id } => handle_randomize(storage, context, game_id, rng)
+            .await
+            .map(CommandResponse::public),
         DiscordCommand::Winner(command) => handle_winner(storage, context, command).await,
         DiscordCommand::Result { game_id, winner } => {
-            handle_result(storage, context, game_id, winner).await
+            handle_result(storage, context, game_id, winner)
+                .await
+                .map(CommandResponse::public)
         }
-        DiscordCommand::Results(command) => {
-            handle_results(storage, resolver, context, command).await
-        }
-        DiscordCommand::Finish(command) => handle_finish(storage, resolver, context, command).await,
-        DiscordCommand::Hydrate(command) => {
-            handle_hydrate(storage, resolver, context, command).await
-        }
+        DiscordCommand::Results(command) => handle_results(storage, resolver, context, command)
+            .await
+            .map(CommandResponse::public),
+        DiscordCommand::Finish(command) => handle_finish(storage, resolver, context, command)
+            .await
+            .map(CommandResponse::public),
+        DiscordCommand::Hydrate(command) => handle_hydrate(storage, resolver, context, command)
+            .await
+            .map(CommandResponse::ephemeral),
         DiscordCommand::LinkMatch(command) => {
-            handle_link_match(storage, resolver, context, command).await
+            handle_link_match(storage, resolver, context, command)
+                .await
+                .map(CommandResponse::public)
         }
-        DiscordCommand::End { game_id } => handle_end(storage, context, game_id).await,
-        DiscordCommand::Status { game_id } => handle_status(storage, context, game_id).await,
+        DiscordCommand::End { game_id } => handle_end(storage, context, game_id)
+            .await
+            .map(CommandResponse::public),
+        DiscordCommand::Status { game_id } => handle_status(storage, context, game_id)
+            .await
+            .map(CommandResponse::ephemeral),
         DiscordCommand::Stats(command) => handle_stats(storage, context, command).await,
         DiscordCommand::Leaderboards { mode } => {
-            let rows = storage.leaderboard(&context.guild_id, mode, 10).await?;
+            let rows = storage
+                .leaderboard(&context.guild_id, mode, LEADERBOARD_LIMIT)
+                .await?;
             if rows.is_empty() {
-                return Ok("No leaderboard rows yet.".to_owned());
+                return Ok(CommandResponse::public("No leaderboard rows yet."));
             }
-            let lines = rows
-                .iter()
-                .enumerate()
-                .map(|(idx, row)| {
-                    let summary = format_stats_line(
-                        &format!("{}#{}", row.riot_game_name, row.riot_tag_line),
-                        row.rating,
-                        row.wins,
-                        row.losses,
-                        row.win_rate,
-                        StatsAverages {
-                            kills: row.avg_kills,
-                            deaths: row.avg_deaths,
-                            assists: row.avg_assists,
-                            damage: row.avg_total_damage,
-                        },
-                    );
-                    format!("{}. {}", idx + 1, summary)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(lines)
+            let overview = stats_overview_card(&rows, mode);
+            Ok(CommandResponse::public(format_stats_overview(&overview))
+                .with_stats_overview_card(overview))
         }
         DiscordCommand::Analysis { mode } => {
             let suffix = mode.map_or(String::new(), |mode| format!(" for {}", mode.as_str()));
-            Ok(format!(
+            Ok(CommandResponse::ephemeral(format!(
                 "Analysis{suffix} is wired as a v1 stub. Need more rows first."
-            ))
+            )))
         }
     }
 }
@@ -231,33 +330,12 @@ async fn handle_create<S: Storage + ?Sized>(
     context: CommandContext,
     command: CreateCommand,
     rng: &mut impl Rng,
-) -> Result<String, HandlerError> {
+) -> Result<CommandResponse, HandlerError> {
     ensure_unique_users(&command.users)?;
-    storage
-        .get_player(&context.guild_id, &context.actor_id)
-        .await
-        .map_err(|error| match error {
-            StorageError::NotFound => HandlerError::UserFacing(
-                "Use `/register-summoners` before creating games.".to_owned(),
-            ),
-            other => HandlerError::Storage(other),
-        })?;
-    for user in &command.users {
-        storage
-            .get_player(&context.guild_id, user.as_str())
-            .await
-            .map_err(|error| match error {
-                StorageError::NotFound => HandlerError::UserFacing(format!(
-                    "<@{}> needs `/register-summoners` before joining.",
-                    user.as_str()
-                )),
-                other => HandlerError::Storage(other),
-            })?;
-    }
 
     let assignments = split_even_teams(&command.users, rng)
         .map_err(|err| HandlerError::UserFacing(format!("Cannot randomize: {err}")))?;
-    let game_id = next_local_game_id(storage, rng).await?;
+    let game_id = GameId::new(format!("g_{}", nanoid::nanoid!(10)));
     let user_ids = command
         .users
         .iter()
@@ -285,12 +363,12 @@ async fn handle_create<S: Storage + ?Sized>(
     storage
         .assign_teams(&game_id, &assignments, context.now)
         .await?;
-    Ok(format!(
-        "Created with gameId {} ({})\n{}",
+    Ok(CommandResponse::public(format!(
+        "Created game `{}` ({})",
         game_id,
-        command.mode.as_str(),
-        format_assignments(&assignments)
+        command.mode.as_str()
     ))
+    .with_team_card(team_card(&game_id, command.mode, &assignments)))
 }
 
 async fn handle_game<S: Storage + ?Sized>(
@@ -356,7 +434,7 @@ async fn handle_add<S: Storage + ?Sized>(
     context: CommandContext,
     command: AddCommand,
     rng: &mut impl Rng,
-) -> Result<String, HandlerError> {
+) -> Result<CommandResponse, HandlerError> {
     let (game_id, game) = load_game_for_guild(
         storage,
         &context.guild_id,
@@ -388,17 +466,6 @@ async fn handle_add<S: Storage + ?Sized>(
                 game_id
             )));
         }
-        storage
-            .get_player(&context.guild_id, user.as_str())
-            .await
-            .map_err(|error| match error {
-                StorageError::NotFound => HandlerError::UserFacing(format!(
-                    "<@{}> needs `/register-summoners` before joining {}.",
-                    user.as_str(),
-                    game_id
-                )),
-                other => HandlerError::Storage(other),
-            })?;
     }
 
     for user in &command.users {
@@ -416,9 +483,9 @@ async fn handle_add<S: Storage + ?Sized>(
     let updated_roster = storage.roster(&game_id).await?;
     let player_count = updated_roster.len();
     if player_count % 2 != 0 {
-        return Ok(format!(
+        return Ok(CommandResponse::public(format!(
             "Added {mentions} to {game_id}. Roster has {player_count} players; add one more before teams are assigned."
-        ));
+        )));
     }
 
     let users = updated_roster
@@ -435,10 +502,77 @@ async fn handle_add<S: Storage + ?Sized>(
     } else {
         "Teams were randomized."
     };
-    Ok(format!(
-        "Added {mentions} to {game_id}. {prefix}\n{}",
-        format_assignments(&assignments)
+    let mode = game
+        .mode()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored mode: {err}")))?;
+    Ok(
+        CommandResponse::public(format!("Added {mentions} to `{game_id}`. {prefix}"))
+            .with_team_card(team_card(&game_id, mode, &assignments)),
+    )
+}
+
+async fn handle_next<S: Storage + ?Sized>(
+    storage: &S,
+    context: CommandContext,
+) -> Result<CommandResponse, HandlerError> {
+    if storage
+        .open_game_for_guild(&context.guild_id)
+        .await?
+        .is_some()
+    {
+        return Err(HandlerError::UserFacing(
+            "Close the current open game with `/winner` before starting `/next`.".to_owned(),
+        ));
+    }
+
+    let previous = storage
+        .latest_game_for_guild(&context.guild_id)
+        .await?
+        .ok_or_else(|| {
+            HandlerError::UserFacing("No previous game found for `/next`.".to_owned())
+        })?;
+    let previous_id = GameId::new(previous.game_id.clone());
+    let mode = previous
+        .mode()
+        .map_err(|err| HandlerError::UserFacing(format!("Invalid stored mode: {err}")))?;
+    let roster = storage.roster(&previous_id).await?;
+    let assignments = next_rotation_assignments(&roster)?;
+    let game_id = GameId::new(format!("g_{}", nanoid::nanoid!(10)));
+    let user_ids = roster
+        .iter()
+        .map(|player| player.discord_user_id.clone())
+        .collect::<Vec<_>>();
+
+    storage
+        .create_game(
+            NewGame {
+                game_id: game_id.as_str().to_owned(),
+                guild_id: context.guild_id,
+                channel_id: context.channel_id,
+                creator_discord_id: context.actor_id,
+                mode,
+                now: context.now,
+            },
+            &user_ids,
+        )
+        .await
+        .map_err(|error| match error {
+            StorageError::ActiveGameExists => HandlerError::UserFacing(
+                "An open game already exists. Close it with `/winner` first.".to_owned(),
+            ),
+            other => HandlerError::Storage(other),
+        })?;
+    storage
+        .assign_teams(&game_id, &assignments, context.now)
+        .await?;
+
+    Ok(CommandResponse::public(format!(
+        "Created next game `{}` from `{}` ({})",
+        game_id,
+        previous_id,
+        mode.as_str()
     ))
+    .with_team_card(team_card(&game_id, mode, &assignments)))
 }
 
 fn ensure_unique_users(users: &[DiscordUserId]) -> Result<(), HandlerError> {
@@ -452,23 +586,6 @@ fn ensure_unique_users(users: &[DiscordUserId]) -> Result<(), HandlerError> {
         }
     }
     Ok(())
-}
-
-async fn next_local_game_id<S: Storage + ?Sized>(
-    storage: &S,
-    rng: &mut impl Rng,
-) -> Result<GameId, HandlerError> {
-    for _ in 0..20 {
-        let candidate = GameId::new((1000 + (rng.next_u32() % 9000)).to_string());
-        match storage.game_by_id(&candidate).await {
-            Ok(_) => continue,
-            Err(StorageError::NotFound) => return Ok(candidate),
-            Err(error) => return Err(HandlerError::Storage(error)),
-        }
-    }
-    Err(HandlerError::UserFacing(
-        "Could not allocate a 4-digit game id after 20 attempts.".to_owned(),
-    ))
 }
 
 async fn handle_randomize<S: Storage + ?Sized>(
@@ -524,11 +641,127 @@ fn format_assignments(assignments: &[TeamAssignment]) -> String {
     format!("Red team: {red}\nBlue team: {blue}")
 }
 
+fn team_card(game_id: &GameId, mode: GameModeKind, assignments: &[TeamAssignment]) -> TeamCard {
+    TeamCard {
+        game_id: game_id.clone(),
+        mode,
+        red: team_members(assignments, TeamSide::Red),
+        blue: team_members(assignments, TeamSide::Blue),
+    }
+}
+
+fn team_members(assignments: &[TeamAssignment], side: TeamSide) -> Vec<DiscordUserId> {
+    assignments
+        .iter()
+        .filter(|assignment| assignment.team == side)
+        .map(|assignment| assignment.discord_user_id.clone())
+        .collect()
+}
+
+fn next_rotation_assignments(roster: &[RosterPlayer]) -> Result<Vec<TeamAssignment>, HandlerError> {
+    if roster.len() < 2 {
+        return Err(HandlerError::UserFacing(
+            "`/next` needs at least two players in the previous game.".to_owned(),
+        ));
+    }
+    if roster.len() % 2 != 0 {
+        return Err(HandlerError::UserFacing(
+            "`/next` needs an even previous roster. Use `/create` for the new roster.".to_owned(),
+        ));
+    }
+
+    let mut players = roster
+        .iter()
+        .map(|player| DiscordUserId::new(player.discord_user_id.clone()))
+        .collect::<Vec<_>>();
+    players.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+    let team_size = players.len() / 2;
+    let combinations = index_combinations(players.len(), team_size);
+    let current_blue = roster
+        .iter()
+        .filter(|player| player.team_side() == Some(TeamSide::Blue))
+        .map(|player| player.discord_user_id.as_str())
+        .collect::<HashSet<_>>();
+    let current = players
+        .iter()
+        .enumerate()
+        .filter_map(|(index, player)| current_blue.contains(player.as_str()).then_some(index))
+        .collect::<Vec<_>>();
+    let next = combinations
+        .iter()
+        .position(|candidate| candidate == &current)
+        .map_or_else(
+            || combinations.first().cloned(),
+            |index| combinations.get((index + 1) % combinations.len()).cloned(),
+        )
+        .ok_or_else(|| HandlerError::UserFacing("Could not build the next rotation.".to_owned()))?;
+    let blue_indices = next.into_iter().collect::<HashSet<_>>();
+
+    let mut blue_slot = 0_u8;
+    let mut red_slot = 0_u8;
+    let assignments = players
+        .into_iter()
+        .enumerate()
+        .map(|(index, discord_user_id)| {
+            let (team, slot) = if blue_indices.contains(&index) {
+                let slot = blue_slot;
+                blue_slot = blue_slot.saturating_add(1);
+                (TeamSide::Blue, slot)
+            } else {
+                let slot = red_slot;
+                red_slot = red_slot.saturating_add(1);
+                (TeamSide::Red, slot)
+            };
+            TeamAssignment {
+                discord_user_id,
+                team,
+                slot,
+            }
+        })
+        .collect();
+    Ok(assignments)
+}
+
+fn index_combinations(size: usize, selected: usize) -> Vec<Vec<usize>> {
+    if selected == 0 || selected > size {
+        return Vec::new();
+    }
+
+    let mut combinations = Vec::new();
+    let mut current = Vec::with_capacity(selected);
+    push_index_combinations(0, size, selected, &mut current, &mut combinations);
+    combinations
+}
+
+fn push_index_combinations(
+    start: usize,
+    size: usize,
+    selected: usize,
+    current: &mut Vec<usize>,
+    combinations: &mut Vec<Vec<usize>>,
+) {
+    if current.len() == selected {
+        combinations.push(current.clone());
+        return;
+    }
+    let remaining = selected - current.len();
+    if size.saturating_sub(start) < remaining {
+        return;
+    }
+    let last_start = size - remaining;
+    for index in start..=last_start {
+        current.push(index);
+        push_index_combinations(index + 1, size, selected, current, combinations);
+        current.pop();
+    }
+}
+
 async fn handle_winner<S: Storage + ?Sized>(
     storage: &S,
     context: CommandContext,
     command: WinnerCommand,
-) -> Result<String, HandlerError> {
+) -> Result<CommandResponse, HandlerError> {
     let game = storage.game_by_id(&command.game_id).await?;
     ensure_game_in_guild(&game, &context.guild_id)?;
     let status = game
@@ -564,11 +797,11 @@ async fn handle_winner<S: Storage + ?Sized>(
                     context.now,
                 )
                 .await?;
-            Ok(format!(
+            Ok(CommandResponse::public(format!(
                 "Marked game {} won by {}.",
                 command.game_id,
                 command.winner.as_str()
-            ))
+            )))
         }
     }
 }
@@ -1220,7 +1453,19 @@ async fn handle_stats<S: Storage + ?Sized>(
     storage: &S,
     context: CommandContext,
     command: StatsCommand,
-) -> Result<String, HandlerError> {
+) -> Result<CommandResponse, HandlerError> {
+    if command.user.is_none() && command.name.is_none() {
+        let rows = storage
+            .leaderboard(&context.guild_id, command.mode, STATS_OVERVIEW_LIMIT)
+            .await?;
+        if rows.is_empty() {
+            return Ok(CommandResponse::ephemeral("No stats found yet."));
+        }
+        let overview = stats_overview_card(&rows, command.mode);
+        return Ok(CommandResponse::ephemeral(format_stats_overview(&overview))
+            .with_stats_overview_card(overview));
+    }
+
     let discord_user_id = match (command.user, command.name.as_deref()) {
         (Some(user), None) => user,
         (None, Some(name)) => storage
@@ -1230,7 +1475,11 @@ async fn handle_stats<S: Storage + ?Sized>(
             .ok_or_else(|| {
                 HandlerError::UserFacing(format!("No registered player found for `{name}`."))
             })?,
-        (None, None) => DiscordUserId::new(context.actor_id.clone()),
+        (None, None) => {
+            return Err(HandlerError::UserFacing(
+                "Use `/stats`, `/stats user:...`, or `/stats name:...`.".to_owned(),
+            ));
+        }
         (Some(_), Some(_)) => {
             return Err(HandlerError::UserFacing(
                 "Use either `name` or `user`, not both.".to_owned(),
@@ -1242,12 +1491,17 @@ async fn handle_stats<S: Storage + ?Sized>(
         .stats_for_player(&context.guild_id, discord_user_id.as_str(), command.mode)
         .await?
     else {
-        return Ok("No stats found for that player yet.".to_owned());
+        return Ok(CommandResponse::ephemeral(
+            "No stats found for that player yet.",
+        ));
     };
     let teammates = storage
         .teammate_stats(&context.guild_id, discord_user_id.as_str(), command.mode)
         .await?;
-    Ok(format_detailed_stats(&stats, &teammates))
+    Ok(
+        CommandResponse::ephemeral(format_detailed_stats(&stats, &teammates))
+            .with_stats_card(stats_card(&stats, &teammates, command.mode)),
+    )
 }
 
 async fn load_game_for_guild<S: Storage + ?Sized>(
@@ -1405,37 +1659,6 @@ fn side_from_team_id(team_id: Option<u16>) -> Option<TeamSide> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct StatsAverages {
-    kills: Option<f64>,
-    deaths: Option<f64>,
-    assists: Option<f64>,
-    damage: Option<f64>,
-}
-
-fn format_stats_line(
-    label: &str,
-    rating: i32,
-    wins: i32,
-    losses: i32,
-    win_rate: f64,
-    averages: StatsAverages,
-) -> String {
-    let mut line = format!(
-        "{label}: {wins}W-{losses}L, {:.1}% WR, rating {rating}",
-        win_rate * 100.0
-    );
-    if let (Some(kills), Some(deaths), Some(assists)) =
-        (averages.kills, averages.deaths, averages.assists)
-    {
-        line.push_str(&format!(", {:.1}/{:.1}/{:.1} KDA", kills, deaths, assists));
-    }
-    if let Some(damage) = averages.damage {
-        line.push_str(&format!(", {:.0} avg dmg", damage));
-    }
-    line
-}
-
 fn format_detailed_stats(stats: &PlayerStatsRow, teammates: &[TeammateStatsRow]) -> String {
     let games_total = stats.wins + stats.losses;
     let win_rate = stats.win_rate * 100.0;
@@ -1449,9 +1672,8 @@ fn format_detailed_stats(stats: &PlayerStatsRow, teammates: &[TeammateStatsRow])
         .max_by_key(|row| (row.losses, row.games));
 
     format!(
-        "{}#{}\nW: {} L: {} Games total: {} WR: {:.1}% Rating: {}\nMost won with players: {}\nMost lost with players: {}",
-        stats.riot_game_name,
-        stats.riot_tag_line,
+        "{}\nW: {} L: {} Games total: {} WR: {:.1}% Rating: {}\nMost won with players: {}\nMost lost with players: {}",
+        display_riot_id(&stats.discord_user_id, &stats.riot_game_name, &stats.riot_tag_line),
         stats.wins,
         stats.losses,
         games_total,
@@ -1462,13 +1684,174 @@ fn format_detailed_stats(stats: &PlayerStatsRow, teammates: &[TeammateStatsRow])
     )
 }
 
+fn stats_overview_card(rows: &[LeaderboardRow], mode: Option<GameModeKind>) -> StatsOverviewCard {
+    StatsOverviewCard {
+        mode_label: mode_label(mode),
+        rows: rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| stats_overview_row(index + 1, row))
+            .collect(),
+    }
+}
+
+fn stats_overview_row(rank: usize, row: &LeaderboardRow) -> StatsOverviewRow {
+    StatsOverviewRow {
+        rank,
+        discord_user_id: DiscordUserId::new(row.discord_user_id.clone()),
+        riot_id: display_riot_id(
+            &row.discord_user_id,
+            &row.riot_game_name,
+            &row.riot_tag_line,
+        ),
+        rating: row.rating,
+        wins: row.wins,
+        losses: row.losses,
+        games_total: row.wins + row.losses,
+        win_rate: format!("{:.1}%", row.win_rate * 100.0),
+        kda: format_kda_values(row.avg_kills, row.avg_deaths, row.avg_assists),
+        average_damage: row
+            .avg_total_damage
+            .map(|damage| format!("{damage:.0} avg dmg")),
+    }
+}
+
+fn format_stats_overview(card: &StatsOverviewCard) -> String {
+    let rows = card
+        .rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}. {} {}W/{}L {} WR rating {}",
+                row.rank, row.riot_id, row.wins, row.losses, row.win_rate, row.rating
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Stats for everyone ({})\n{rows}", card.mode_label)
+}
+
+fn stats_card(
+    stats: &PlayerStatsRow,
+    teammates: &[TeammateStatsRow],
+    mode: Option<GameModeKind>,
+) -> StatsCard {
+    StatsCard {
+        discord_user_id: DiscordUserId::new(stats.discord_user_id.clone()),
+        riot_id: display_riot_id(
+            &stats.discord_user_id,
+            &stats.riot_game_name,
+            &stats.riot_tag_line,
+        ),
+        mode_label: mode_label(mode),
+        rating: stats.rating,
+        wins: stats.wins,
+        losses: stats.losses,
+        games_total: stats.wins + stats.losses,
+        win_rate: format!("{:.1}%", stats.win_rate * 100.0),
+        kda: format_kda_values(stats.avg_kills, stats.avg_deaths, stats.avg_assists),
+        average_damage: stats
+            .avg_total_damage
+            .map(|damage| format!("{damage:.0} avg dmg")),
+        most_won_with: top_teammates_by_wins(teammates)
+            .into_iter()
+            .map(format_teammate_card_row)
+            .collect(),
+        most_lost_with: top_teammates_by_losses(teammates)
+            .into_iter()
+            .map(format_teammate_card_row)
+            .collect(),
+    }
+}
+
+fn mode_label(mode: Option<GameModeKind>) -> String {
+    mode.map_or_else(|| "all modes".to_owned(), |mode| mode.as_str().to_owned())
+}
+
+fn format_kda_values(
+    kills: Option<f64>,
+    deaths: Option<f64>,
+    assists: Option<f64>,
+) -> Option<String> {
+    match (kills, deaths, assists) {
+        (Some(kills), Some(deaths), Some(assists)) => {
+            Some(format!("{kills:.1}/{deaths:.1}/{assists:.1} KDA"))
+        }
+        _ => None,
+    }
+}
+
+fn display_riot_id(discord_user_id: &str, riot_game_name: &str, riot_tag_line: &str) -> String {
+    if is_pending_riot_id(discord_user_id, riot_game_name, riot_tag_line) {
+        "unregistered".to_owned()
+    } else {
+        format!("{riot_game_name}#{riot_tag_line}")
+    }
+}
+
+fn top_teammates_by_wins(teammates: &[TeammateStatsRow]) -> Vec<&TeammateStatsRow> {
+    let mut rows = teammates
+        .iter()
+        .filter(|row| row.wins > 0)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .wins
+            .cmp(&left.wins)
+            .then_with(|| right.games.cmp(&left.games))
+            .then_with(|| left.losses.cmp(&right.losses))
+            .then_with(|| left.riot_game_name.cmp(&right.riot_game_name))
+    });
+    rows.truncate(3);
+    rows
+}
+
+fn top_teammates_by_losses(teammates: &[TeammateStatsRow]) -> Vec<&TeammateStatsRow> {
+    let mut rows = teammates
+        .iter()
+        .filter(|row| row.losses > 0)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .losses
+            .cmp(&left.losses)
+            .then_with(|| right.games.cmp(&left.games))
+            .then_with(|| left.wins.cmp(&right.wins))
+            .then_with(|| left.riot_game_name.cmp(&right.riot_game_name))
+    });
+    rows.truncate(3);
+    rows
+}
+
+fn format_teammate_card_row(row: &TeammateStatsRow) -> String {
+    format!(
+        "<@{}> - {} - {}W/{}L, {} games",
+        row.discord_user_id,
+        display_riot_id(
+            &row.discord_user_id,
+            &row.riot_game_name,
+            &row.riot_tag_line
+        ),
+        row.wins,
+        row.losses,
+        row.games
+    )
+}
+
 fn format_teammate_row(row: Option<&TeammateStatsRow>) -> String {
     row.map_or_else(
         || "none yet".to_owned(),
         |row| {
             format!(
-                "{}#{} ({}W/{}L, {} games)",
-                row.riot_game_name, row.riot_tag_line, row.wins, row.losses, row.games
+                "{} ({}W/{}L, {} games)",
+                display_riot_id(
+                    &row.discord_user_id,
+                    &row.riot_game_name,
+                    &row.riot_tag_line
+                ),
+                row.wins,
+                row.losses,
+                row.games
             )
         },
     )
@@ -1478,10 +1861,13 @@ fn format_teammate_row(row: Option<&TeammateStatsRow>) -> String {
 mod tests {
     use crate::{
         format_detailed_stats, format_match_sync_outcomes, format_status_match_links,
-        MatchSyncOutcome,
+        next_rotation_assignments, stats_card, stats_overview_card, MatchSyncOutcome,
     };
-    use rsso_domain::GameId;
-    use rsso_storage::{MatchLinkRow, PlayerStatsRow, TeammateStatsRow};
+    use rsso_domain::{GameId, GameModeKind, TeamSide};
+    use rsso_storage::{
+        pending_riot_game_name, LeaderboardRow, MatchLinkRow, PlayerStatsRow, RosterPlayer,
+        TeammateStatsRow, PENDING_RIOT_TAG_LINE,
+    };
 
     #[test]
     fn formats_batch_hydrate_outcomes() {
@@ -1571,5 +1957,130 @@ mod tests {
         assert!(message.contains("W: 12 L: 8 Games total: 20 WR: 60.0%"));
         assert!(message.contains("Most won with players: Vu#NA1"));
         assert!(message.contains("Most lost with players: Chongly#NA1"));
+    }
+
+    #[test]
+    fn builds_stats_card_with_mentions_and_averages() {
+        let stats = PlayerStatsRow {
+            guild_id: "g".to_owned(),
+            discord_user_id: "1".to_owned(),
+            riot_game_name: "Cyracen".to_owned(),
+            riot_tag_line: "NA1".to_owned(),
+            rating: 1520,
+            wins: 12,
+            losses: 8,
+            win_rate: 0.6,
+            avg_kills: Some(8.2),
+            avg_deaths: Some(4.4),
+            avg_assists: Some(19.1),
+            avg_total_damage: Some(28_450.0),
+        };
+        let teammates = vec![
+            TeammateStatsRow {
+                discord_user_id: "2".to_owned(),
+                riot_game_name: "Vu".to_owned(),
+                riot_tag_line: "NA1".to_owned(),
+                games: 5,
+                wins: 4,
+                losses: 1,
+            },
+            TeammateStatsRow {
+                discord_user_id: "3".to_owned(),
+                riot_game_name: "Chongly".to_owned(),
+                riot_tag_line: "NA1".to_owned(),
+                games: 6,
+                wins: 1,
+                losses: 5,
+            },
+        ];
+
+        let card = stats_card(&stats, &teammates, Some(GameModeKind::AramMayhem));
+
+        assert_eq!(card.riot_id, "Cyracen#NA1");
+        assert_eq!(card.mode_label, "aram_mayhem");
+        assert_eq!(card.win_rate, "60.0%");
+        assert_eq!(card.kda.as_deref(), Some("8.2/4.4/19.1 KDA"));
+        assert_eq!(card.average_damage.as_deref(), Some("28450 avg dmg"));
+        assert_eq!(
+            card.most_won_with,
+            vec![
+                "<@2> - Vu#NA1 - 4W/1L, 5 games".to_owned(),
+                "<@3> - Chongly#NA1 - 1W/5L, 6 games".to_owned(),
+            ]
+        );
+        assert_eq!(
+            card.most_lost_with,
+            vec![
+                "<@3> - Chongly#NA1 - 1W/5L, 6 games".to_owned(),
+                "<@2> - Vu#NA1 - 4W/1L, 5 games".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_everyone_stats_card_and_hides_pending_riot_id() {
+        let rows = vec![
+            LeaderboardRow {
+                discord_user_id: "1".to_owned(),
+                riot_game_name: "Cyracen".to_owned(),
+                riot_tag_line: "NA1".to_owned(),
+                rating: 1520,
+                wins: 12,
+                losses: 8,
+                win_rate: 0.6,
+                avg_kills: Some(8.2),
+                avg_deaths: Some(4.4),
+                avg_assists: Some(19.1),
+                avg_total_damage: Some(28_450.0),
+            },
+            LeaderboardRow {
+                discord_user_id: "2".to_owned(),
+                riot_game_name: pending_riot_game_name("2"),
+                riot_tag_line: PENDING_RIOT_TAG_LINE.to_owned(),
+                rating: 1500,
+                wins: 0,
+                losses: 0,
+                win_rate: 0.0,
+                avg_kills: None,
+                avg_deaths: None,
+                avg_assists: None,
+                avg_total_damage: None,
+            },
+        ];
+
+        let card = stats_overview_card(&rows, None);
+
+        assert_eq!(card.mode_label, "all modes");
+        assert_eq!(card.rows[0].riot_id, "Cyracen#NA1");
+        assert_eq!(card.rows[0].games_total, 20);
+        assert_eq!(card.rows[0].kda.as_deref(), Some("8.2/4.4/19.1 KDA"));
+        assert_eq!(card.rows[1].riot_id, "unregistered");
+        assert_eq!(card.rows[1].games_total, 0);
+    }
+
+    #[test]
+    fn next_rotation_advances_balanced_split() {
+        let roster = vec![
+            roster_player("1", "blue"),
+            roster_player("2", "blue"),
+            roster_player("3", "red"),
+            roster_player("4", "red"),
+        ];
+        let assignments = next_rotation_assignments(&roster).expect("next rotation");
+        let blue = assignments
+            .iter()
+            .filter(|assignment| assignment.team == TeamSide::Blue)
+            .map(|assignment| assignment.discord_user_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(blue, vec!["1", "3"]);
+    }
+
+    fn roster_player(discord_user_id: &str, team: &str) -> RosterPlayer {
+        RosterPlayer {
+            discord_user_id: discord_user_id.to_owned(),
+            riot_puuid: None,
+            team: Some(team.to_owned()),
+            rating: 1500,
+        }
     }
 }

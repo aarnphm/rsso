@@ -1145,6 +1145,7 @@ dependencies = [
  "rsso-handlers",
  "rsso-riot",
  "rsso-storage",
+ "serde",
  "serde_json",
  "wasm-bindgen",
  "worker",
